@@ -228,6 +228,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
             passedTests: null,
             failedTests: null,
             flakyTests: null,
+            skippedTests: null,
             failedTestTitles: [],
             lastRunAt: null
         }]
@@ -384,6 +385,7 @@ if [[ "$SKIP_RUN" == "false" ]] && [[ ${#COVERED_SPECS[@]} -gt 0 ]]; then
                     ([$activeSpecs[] | select(.failed | not)] | length) as $passed |
                     ([$activeSpecs[] | select(.failed) | select(.flaky)] | length) as $flaky |
                     ($total - $passed - $flaky) as $failed |
+                    ([$dedupedSpecs[] | select(.skippedOnly)] | length) as $skipped |
 
                     # Determine result
                     (if $failed > 0 then "failing"
@@ -398,6 +400,7 @@ if [[ "$SKIP_RUN" == "false" ]] && [[ ${#COVERED_SPECS[@]} -gt 0 ]]; then
                     .passedTests = $passed |
                     .failedTests = $failed |
                     .flakyTests = $flaky |
+                    .skippedTests = $skipped |
                     .failedTestTitles = $failedTitles |
                     .lastRunAt = (now | todate)
                 else
@@ -415,7 +418,7 @@ else
 fi
 
 # Summary of parsed results
-echo "$STATUSES_JSON" | jq -r '.[] | "  \(.storyKey): \(.result // "no-run") \(.passedTests // "-")/\(.totalTests // "-") \(if (.failedTestTitles | length) > 0 then "FAILED: " + (.failedTestTitles | join(", ")) else "" end)"'
+echo "$STATUSES_JSON" | jq -r '.[] | "  \(.storyKey): \(.result // "no-run") \(.passedTests // "-")/\(.totalTests // "-")\(if (.skippedTests // 0) > 0 then " (\(.skippedTests) skipped)" else "" end)\(if (.failedTestTitles | length) > 0 then " FAILED: " + (.failedTestTitles | join(", ")) else "" end)"'
 
 # ---- Step 4: Build and post payload ----
 
