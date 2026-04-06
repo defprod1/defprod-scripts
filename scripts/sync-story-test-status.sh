@@ -296,16 +296,37 @@ if [[ "$SKIP_RUN" == "false" ]] && [[ ${#COVERED_SPECS[@]} -gt 0 ]]; then
 
     PW_JSON_REPORT="$RESULTS_DIR/results.json"
 
-    # Build grep pattern for covered specs
-    SPEC_PATTERN=$(printf '%s\n' "${COVERED_SPECS[@]}" | sed 's|/|/|g' | paste -sd '|' -)
+    # Resolve package directory from playwright config so we run the
+    # package-local playwright binary (avoids dual-instance errors when
+    # a global playwright is also installed).
+    PW_CONFIG_ABS=$(cd "$(dirname "$PW_CONFIG")" && pwd)/$(basename "$PW_CONFIG")
+    PW_CONFIG_DIR=$(dirname "$PW_CONFIG_ABS")
+    PW_LOCAL_BIN="$PW_CONFIG_DIR/node_modules/.bin/playwright"
+
+    # Build list of test directories to pass as positional args
+    # (--grep filters by test title, not file path, so we pass dirs instead)
+    SPEC_DIRS=()
+    for spec in "${COVERED_SPECS[@]}"; do
+        SPEC_DIRS+=("$(cd "$AREAS_ROOT/$spec" && pwd)")
+    done
+
+    # Prefer package-local playwright to avoid dual-instance errors.
+    # Check .bin symlink first, then cli.js in common locations.
+    PW_LOCAL_CLI="$PW_CONFIG_DIR/node_modules/playwright/cli.js"
+    if [[ -x "$PW_LOCAL_BIN" ]]; then
+        PW_CMD=("$PW_LOCAL_BIN")
+    elif [[ -f "$PW_LOCAL_CLI" ]]; then
+        PW_CMD=(node "$PW_LOCAL_CLI")
+    else
+        PW_CMD=(npx playwright)
+    fi
 
     # Run Playwright with JSON reporter
     PLAYWRIGHT_JSON_OUTPUT_FILE="$PW_JSON_REPORT" \
-        npx playwright test \
-        --config="$PW_CONFIG" \
+        "${PW_CMD[@]}" test \
+        --config="$PW_CONFIG_ABS" \
         --reporter=json \
-        --grep="$SPEC_PATTERN" \
-        "$TEST_DIR" 2>/dev/null || true
+        "${SPEC_DIRS[@]}" 2>/dev/null || true
 
     # Parse results if JSON report exists
     if [[ -f "$PW_JSON_REPORT" ]]; then
