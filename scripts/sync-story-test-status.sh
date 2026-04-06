@@ -336,14 +336,17 @@ if [[ "$SKIP_RUN" == "false" ]] && [[ ${#COVERED_SPECS[@]} -gt 0 ]]; then
         STATUSES_JSON=$(echo "$STATUSES_JSON" | jq --slurpfile results "$PW_JSON_REPORT" '
             ($results[0].suites // []) as $suites |
 
-            # Flatten all specs from suites
+            # Flatten all specs from suites.
+            # The JSON may have one entry per spec (tests[] has all browsers)
+            # or one entry per browser (tests[] has one browser). We handle
+            # both by grouping by title and checking tests across all entries.
             [($suites[] | .. | .specs? // empty | .[]) |
                 {
                     file: .file,
                     title: .title,
-                    ok: .ok,
                     tests: [.tests[] | {
                         status: .status,
+                        projectName: .projectName,
                         results: [.results[] | .status]
                     }]
                 }
@@ -356,10 +359,30 @@ if [[ "$SKIP_RUN" == "false" ]] && [[ ${#COVERED_SPECS[@]} -gt 0 ]]; then
                 [$allSpecs[] | select(.file | contains($storyPath))] as $matchingSpecs |
 
                 if ($matchingSpecs | length) > 0 then
+                    # Group by title to deduplicate across browser entries,
+                    # then aggregate all tests from all entries in each group.
+                    # A spec FAILS if ANY browser has status "unexpected".
+                    # A spec is FLAKY if any result is "flaky".
+                    ([($matchingSpecs | group_by(.title))[] |
+                        # Collect all tests from all entries in this group
+                        [.[].tests[]] as $allTests |
+                        # Exclude skipped-only specs (all browsers skipped)
+                        ([$allTests[] | select(.status != "skipped")] | length) as $ranCount |
+                        {
+                            title: .[0].title,
+                            failed: ([$allTests[] | select(.status == "unexpected")] | length > 0),
+                            flaky: ([$allTests[] | .results[] | select(. == "flaky")] | length > 0),
+                            skippedOnly: ($ranCount == 0)
+                        }
+                    ]) as $dedupedSpecs |
+
+                    # Exclude specs where all browsers were skipped
+                    ([$dedupedSpecs[] | select(.skippedOnly | not)]) as $activeSpecs |
+
                     # Compute totals
-                    ($matchingSpecs | length) as $total |
-                    ([$matchingSpecs[] | select(.ok == true)] | length) as $passed |
-                    ([$matchingSpecs[] | select(.ok == false) | select(.tests | any(.results | any(. == "flaky")))] | length) as $flaky |
+                    ($activeSpecs | length) as $total |
+                    ([$activeSpecs[] | select(.failed | not)] | length) as $passed |
+                    ([$activeSpecs[] | select(.failed) | select(.flaky)] | length) as $flaky |
                     ($total - $passed - $flaky) as $failed |
 
                     # Determine result
@@ -367,8 +390,8 @@ if [[ "$SKIP_RUN" == "false" ]] && [[ ${#COVERED_SPECS[@]} -gt 0 ]]; then
                      elif $flaky > 0 then "flaky"
                      else "passing" end) as $result |
 
-                    # Failed test titles
-                    ([$matchingSpecs[] | select(.ok == false) | .title]) as $failedTitles |
+                    # Failed test titles (deduplicated)
+                    ([$activeSpecs[] | select(.failed) | .title] | unique) as $failedTitles |
 
                     .result = $result |
                     .totalTests = $total |
@@ -390,6 +413,9 @@ elif [[ "$SKIP_RUN" == "true" ]]; then
 else
     echo "No covered stories — skipping test run"
 fi
+
+# Summary of parsed results
+echo "$STATUSES_JSON" | jq -r '.[] | "  \(.storyKey): \(.result // "no-run") \(.passedTests // "-")/\(.totalTests // "-") \(if (.failedTestTitles | length) > 0 then "FAILED: " + (.failedTestTitles | join(", ")) else "" end)"'
 
 # ---- Step 4: Build and post payload ----
 
