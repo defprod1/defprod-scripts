@@ -1,0 +1,34 @@
+{
+  "name": "@defprod/scripts",
+  "version": "0.1.0",
+  "description": "CLI utilities for DefProd — sync test status, manage products, and automate your definition-driven workflow",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/defprod1/defprod-scripts.git"
+  },
+  "homepage": "https://github.com/defprod1/defprod-scripts",
+  "bugs": {
+    "url": "https://github.com/defprod1/defprod-scripts/issues"
+  },
+  "keywords": [
+    "defprod",
+    "testing",
+    "playwright",
+    "e2e",
+    "ci",
+    "test-status",
+    "product-definition"
+  ],
+  "bin": {
+    "defprod-sync-tests": "scripts/sync-story-test-status.sh"
+  },
+  "files": [
+    "scripts/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
