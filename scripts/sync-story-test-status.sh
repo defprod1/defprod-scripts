@@ -25,7 +25,7 @@ set -euo pipefail
 
 # ---- Helpers ----
 
-VERSION="dev" # baked by prepublish
+VERSION="1.0.5" # baked by prepublish
 
 load_env_file() {
     local file="$1"
@@ -307,7 +307,6 @@ if [[ "$SKIP_RUN" == "false" ]] && [[ ${#COVERED_SPECS[@]} -gt 0 ]]; then
     # a global playwright is also installed).
     PW_CONFIG_ABS=$(cd "$(dirname "$PW_CONFIG")" && pwd)/$(basename "$PW_CONFIG")
     PW_CONFIG_DIR=$(dirname "$PW_CONFIG_ABS")
-    PW_LOCAL_BIN="$PW_CONFIG_DIR/node_modules/.bin/playwright"
 
     # Build list of test directories to pass as positional args
     # (--grep filters by test title, not file path, so we pass dirs instead)
@@ -317,13 +316,21 @@ if [[ "$SKIP_RUN" == "false" ]] && [[ ${#COVERED_SPECS[@]} -gt 0 ]]; then
     done
 
     # Prefer package-local playwright to avoid dual-instance errors.
-    # Check .bin symlink first, then cli.js in common locations.
-    PW_LOCAL_CLI="$PW_CONFIG_DIR/node_modules/playwright/cli.js"
-    if [[ -x "$PW_LOCAL_BIN" ]]; then
-        PW_CMD=("$PW_LOCAL_BIN")
-    elif [[ -f "$PW_LOCAL_CLI" ]]; then
-        PW_CMD=(node "$PW_LOCAL_CLI")
-    else
+    # Walk up from the config directory to find the nearest node_modules
+    # containing playwright (handles monorepos where node_modules is hoisted).
+    PW_CMD=()
+    search_dir="$PW_CONFIG_DIR"
+    while [[ "$search_dir" != "/" ]]; do
+        if [[ -x "$search_dir/node_modules/.bin/playwright" ]]; then
+            PW_CMD=("$search_dir/node_modules/.bin/playwright")
+            break
+        elif [[ -f "$search_dir/node_modules/playwright/cli.js" ]]; then
+            PW_CMD=(node "$search_dir/node_modules/playwright/cli.js")
+            break
+        fi
+        search_dir=$(dirname "$search_dir")
+    done
+    if [[ ${#PW_CMD[@]} -eq 0 ]]; then
         PW_CMD=(npx playwright)
     fi
 
