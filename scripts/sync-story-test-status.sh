@@ -19,10 +19,13 @@
 #   --dry-run           Print payload without posting
 #   --skip-run          Check coverage only, do not run tests
 #   --init              Interactive setup — creates config file
+#   --version, -v       Print version and exit
 #
 set -euo pipefail
 
 # ---- Helpers ----
+
+VERSION="dev" # baked by prepublish
 
 load_env_file() {
     local file="$1"
@@ -115,10 +118,11 @@ EOF
 
 ENV_FILE="${DEFPROD_ENV_FILE:-.defprod.env}"
 
-# Parse --env-file and --init early (before full arg parsing)
+# Parse --env-file, --init, and --version early (before full arg parsing)
 for arg in "$@"; do
     case "$arg" in
         --init) run_init ;;
+        --version|-v) echo "defprod-sync-tests $VERSION"; exit 0 ;;
     esac
 done
 
@@ -157,7 +161,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run)      DRY_RUN=true; shift ;;
         --skip-run)     SKIP_RUN=true; shift ;;
         --init)         run_init ;;
-        -h|--help)      sed -n '3,21p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --version|-v)   echo "defprod-sync-tests $(get_version)"; exit 0 ;;
+        -h|--help)      sed -n '3,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done

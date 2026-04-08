@@ -28,6 +28,9 @@
     "LICENSE",
     "README.md"
   ],
+  "scripts": {
+    "prepublishOnly": "sed -i \"s/^VERSION=\\\"dev\\\" # baked by prepublish$/VERSION=\\\"$(node -p \"require('./package.json').version\")\\\" # baked by prepublish/\" scripts/sync-story-test-status.sh"
+  },
   "engines": {
     "node": ">=18"
   }
