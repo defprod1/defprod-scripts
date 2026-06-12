@@ -88,6 +88,53 @@ jobs:
           DEFPROD_API_KEY: ${{ secrets.DEFPROD_API_KEY }}
 ```
 
+### `defprod-stamp`
+
+Stamps a stage of a DefProd **change record** from a CI/CD hook — so your pipeline reports "built / packaged / staged / shipped" onto the change the commits belong to, and PMs can see delivery progress live in DefProd's Changes view.
+
+The script resolves which change to stamp from your git state: a `chg/CHG-NN-*` branch name, or `Change: CHG-NN` commit trailers (use `--range` to stamp every change in a batched deploy). It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
+
+#### Usage
+
+```bash
+# Finish the 'build' stage for the current change
+defprod-stamp --stage build
+
+# Mark 'build' in progress at the head of the pipeline (the live pulse)
+defprod-stamp --stage build --start
+
+# Batched deploy: stamp 'ship' for every change in the deployed range
+defprod-stamp --stage ship --range "$BEFORE_SHA..$AFTER_SHA"
+```
+
+#### Options
+
+| Option         | Description                                                          | Default        |
+|----------------|----------------------------------------------------------------------|----------------|
+| `--stage`      | Pipeline stage: `merge`/`push`/`build`/`package`/`staging`/`ship`     | — (required)   |
+| `--start`      | Mark the stage in progress instead of finished                        | finish         |
+| `--key`        | Explicit change key (e.g. `CHG-07`) — skips git correlation           | —              |
+| `--branch`     | Branch name to parse instead of the current branch                    | current branch |
+| `--range`      | Git rev range — stamps every change found in its commit trailers      | —              |
+| `--note`       | Optional note for the change's event trail                            | —              |
+| `--product-id` | Product ID (or `DEFPROD_PRODUCT_ID` env var)                          | —              |
+| `--api-url`    | API base URL (or `DEFPROD_API_URL` env var)                           | —              |
+| `--api-key`    | API key with read-write product scope (or `DEFPROD_API_KEY`)          | —              |
+| `--env-file`   | Path to env file                                                      | `.defprod.env` |
+| `--init`       | Interactive setup — creates the env file                              | —              |
+
+#### CI example (GitHub Actions)
+
+```yaml
+      - run: npx @defprod/scripts defprod-stamp --stage build --start
+      - run: npm run build
+      - run: npx @defprod/scripts defprod-stamp --stage build
+        env:
+          DEFPROD_PRODUCT_ID: ${{ secrets.DEFPROD_PRODUCT_ID }}
+          DEFPROD_API_URL: ${{ secrets.DEFPROD_API_URL }}
+          DEFPROD_API_KEY: ${{ secrets.DEFPROD_API_KEY }}
+```
+
 ## Environment variables
 
 All configuration can be provided via environment variables, CLI flags, or a `.env` file (use `--init` to generate one).
