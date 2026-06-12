@@ -1,7 +1,7 @@
 {
   "name": "@defprod/scripts",
   "version": "1.0.6",
-  "description": "CLI utilities for DefProd — sync test status, manage products, and automate your definition-driven workflow",
+  "description": "CLI utilities for DefProd \u2014 sync test status, manage products, and automate your definition-driven workflow",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -21,7 +21,8 @@
     "product-definition"
   ],
   "bin": {
-    "defprod-sync-tests": "scripts/sync-story-test-status.sh"
+    "defprod-sync-tests": "scripts/sync-story-test-status.sh",
+    "defprod-stamp": "scripts/defprod-stamp.sh"
   },
   "files": [
     "scripts/",
