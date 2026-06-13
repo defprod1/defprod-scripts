@@ -18,18 +18,25 @@
 # Usage:
 #   ./defprod-stamp.sh --stage <stage> [options]
 #
-#   --stage             Pipeline stage: merge|push|build|package|staging|ship (required)
-#   --start             Call startChangeStage instead of finishChangeStage
+#   --stage             Pipeline stage: merge|push|build|package|staging|ship
+#                       (required for --start and finish; ignored by --cancel)
+#   --start             Call startChangeStage (mark the stage in progress)
+#   --cancel            Call cancelChangeStage — cancel the in-progress stage
+#                       work, returning it to not started (ignores --stage)
 #   --key               Explicit change key (e.g. CHG-07) — skips git correlation
 #   --branch            Branch name to parse instead of the current branch
 #   --range             Git rev range (e.g. abc123..def456) — stamps EVERY distinct
 #                       change key found in the range's commit trailers
 #   --note              Optional note for the change's event trail
-#   --product-id        Product ID (or DEFPROD_PRODUCT_ID env var)
+#   --product-id        Product ID (or DEFPROD_PRODUCT_ID env var, or .defprod/defprod.json)
 #   --api-url           API base URL, e.g. https://app.defprod.com/api/v1/rpc (or DEFPROD_API_URL)
 #   --api-key           API key with read-write product scope (or DEFPROD_API_KEY)
-#   --env-file          Path to env file (default: .defprod.env or DEFPROD_ENV_FILE)
-#   --init              Interactively write the env file and exit
+#   --env-file          Explicit env file to load (else .defprod/defprod.env, legacy .defprod.env)
+#   --init              Interactively write the .defprod/ config and exit
+#
+# Config resolution (first writer wins): CLI flags > exported env vars >
+# --env-file/DEFPROD_ENV_FILE > .defprod/defprod.env (git-ignored secrets) >
+# .defprod/defprod.json (committed: productId, apiUrl) > legacy .defprod.env.
 #
 # Exit code: ALWAYS 0 unless invoked with bad arguments. A missed stamp is a
 # visibility bug, not a deploy blocker — failures are logged to stderr and the
@@ -54,9 +61,31 @@ load_env_file() {
     done < "$file"
 }
 
+# Load committed, non-secret config (productId, apiUrl) from .defprod/defprod.json.
+# Only fills vars that are still unset, so flags / exported env / the env file win.
+# jq is already a hard dependency of this script.
+load_json_config() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    _json_set() {
+        local var="$1" path="$2" v
+        [[ -n "${!var:-}" ]] && return 0
+        v=$(jq -r "${path} // empty" "$file" 2>/dev/null) || return 0
+        [[ -n "$v" ]] && export "$var=$v"
+        return 0
+    }
+    _json_set DEFPROD_PRODUCT_ID '.productId'
+    _json_set DEFPROD_API_URL '.apiUrl'
+    return 0
+}
+
 init_env_file() {
-    read -rp "Config file location [.defprod.env]: " input_env_file
-    local env_file="${input_env_file:-.defprod.env}"
+    read -rp "Config directory [.defprod]: " input_dir
+    local dir="${input_dir:-.defprod}"
+    local json_file="$dir/defprod.json"
+    local env_file="$dir/defprod.env"
+    mkdir -p "$dir"
     if [[ -f "$env_file" ]]; then
         read -rp "$env_file already exists. Overwrite? [y/N] " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
@@ -65,12 +94,25 @@ init_env_file() {
     input_api_url="${input_api_url:-https://app.defprod.com/api/v1/rpc}"
     read -rp "Product ID: " input_product_id
     read -rp "API key: " input_api_key
+    # Committed, non-secret identity. Merge into any existing defprod.json.
+    if [[ -f "$json_file" ]] && command -v jq >/dev/null 2>&1; then
+        local tmp
+        tmp=$(jq --arg u "$input_api_url" --arg p "$input_product_id" \
+            '.apiUrl=$u | .productId=$p' "$json_file") && printf '%s\n' "$tmp" > "$json_file"
+    else
+        cat > "$json_file" <<EOF
+{
+  "productId": "$input_product_id",
+  "apiUrl": "$input_api_url"
+}
+EOF
+    fi
+    # Secret. Never commit this file.
     cat > "$env_file" <<EOF
-DEFPROD_API_URL=$input_api_url
-DEFPROD_PRODUCT_ID=$input_product_id
 DEFPROD_API_KEY=$input_api_key
 EOF
-    echo "Wrote $env_file"
+    echo "Wrote $json_file (commit this) and $env_file (git-ignore this)."
+    echo "Add to .gitignore: $env_file"
     exit 0
 }
 
@@ -83,12 +125,13 @@ EXPLICIT_KEY=""
 BRANCH=""
 RANGE=""
 NOTE=""
-ENV_FILE="${DEFPROD_ENV_FILE:-.defprod.env}"
+ENV_FILE_EXPLICIT="${DEFPROD_ENV_FILE:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stage) STAGE="$2"; shift 2 ;;
         --start) ACTION="startChangeStage"; shift ;;
+        --cancel) ACTION="cancelChangeStage"; shift ;;
         --key) EXPLICIT_KEY="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         --range) RANGE="$2"; shift 2 ;;
@@ -96,18 +139,22 @@ while [[ $# -gt 0 ]]; do
         --product-id) export DEFPROD_PRODUCT_ID="$2"; shift 2 ;;
         --api-url) export DEFPROD_API_URL="$2"; shift 2 ;;
         --api-key) export DEFPROD_API_KEY="$2"; shift 2 ;;
-        --env-file) ENV_FILE="$2"; shift 2 ;;
+        --env-file) ENV_FILE_EXPLICIT="$2"; shift 2 ;;
         --init) init_env_file ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-if [[ -z "$STAGE" ]]; then
+if [[ -z "$STAGE" && "$ACTION" != "cancelChangeStage" ]]; then
     echo "defprod-stamp: --stage is required (merge|push|build|package|staging|ship)" >&2
     exit 2
 fi
 
-load_env_file "$ENV_FILE"
+# Layered config (first writer wins; flags/exported vars already set above).
+[[ -n "$ENV_FILE_EXPLICIT" ]] && load_env_file "$ENV_FILE_EXPLICIT"
+load_env_file ".defprod/defprod.env"
+load_json_config ".defprod/defprod.json"
+load_env_file ".defprod.env"   # legacy root location (back-compat)
 API_URL="${DEFPROD_API_URL:-}"
 API_KEY="${DEFPROD_API_KEY:-}"
 PRODUCT_ID="${DEFPROD_PRODUCT_ID:-}"
@@ -164,10 +211,17 @@ for KEY in $KEYS; do
     if [[ -n "$NOTE" ]]; then
         NOTE_FIELD=",\"note\":$(jq -Rn --arg n "$NOTE" '$n')"
     fi
+    # cancelChangeStage cancels whatever stage is in progress — it takes no
+    # `stage` (the server resolves it); start/finish carry the explicit stage.
+    if [[ "$ACTION" == "cancelChangeStage" ]]; then
+        INPUT="{\"changeId\":\"$CHANGE_ID\"$NOTE_FIELD}"
+    else
+        INPUT="{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD}"
+    fi
     RESPONSE=$(curl -sk -X POST "$API_URL" \
         -H "Content-Type: application/json" \
         -H "x-api-key: $API_KEY" \
-        -d "{\"name\":\"$ACTION\",\"input\":{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD}}" 2>/dev/null)
+        -d "{\"name\":\"$ACTION\",\"input\":$INPUT}" 2>/dev/null)
     ERROR=$(echo "$RESPONSE" | jq -r '.meta.error // false' 2>/dev/null)
     if [[ "$ERROR" == "true" ]]; then
         DETAIL=$(echo "$RESPONSE" | jq -r '.error.detail // .error.title // "unknown"' 2>/dev/null)
