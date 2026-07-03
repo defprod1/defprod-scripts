@@ -96,7 +96,7 @@ jobs:
 
 Stamps a stage of a DefProd **change record** from a CI/CD hook — so your pipeline reports "built / packaged / staged / shipped" onto the change the commits belong to, and PMs can see delivery progress live in DefProd's Changes view.
 
-The script resolves which change(s) to stamp from your git state, in priority order: `--key` → `--range` (every `Change: CHG-NN` trailer in the range) → a `chg/CHG-NN-*` branch name → the `Change: CHG-NN` trailer on HEAD. Use `--start` to mark a stage in progress and `--cancel` to revert in-progress stage work to not-started (e.g. when a deploy step fails). It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
+The script resolves which change(s) to stamp from your git state, in priority order: `--key` → `--range` (every `Change: <slug>/CHG-NN` trailer in the range) → a `chg/CHG-NN-*` branch name → the `Change: <slug>/CHG-NN` trailer on HEAD. The trailer is **product-scoped by slug**: each key carries its owning product slug, resolved to a productId via `getProductBySlug`, so one push range spanning several products in a monorepo stamps each against the correct product. A legacy bare `Change: CHG-NN` trailer (and the branch / `--key` correlations, which carry no slug) falls back to the configured `DEFPROD_PRODUCT_ID`. Use `--start` to mark a stage in progress and `--cancel` to revert in-progress stage work to not-started (e.g. when a deploy step fails). It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
 
 #### Usage
 
@@ -148,7 +148,7 @@ defprod-stamp --stage ship --range "$BEFORE_SHA..$AFTER_SHA"
 #### Correlating changes in CI
 
 A deploy usually ships **every commit since the last deploy**, and the
-`Change: CHG-NN` trailer can be on any of them — not just `HEAD`. Pick the
+`Change: <slug>/CHG-NN` trailer can be on any of them — not just `HEAD`. Pick the
 correlation that matches how you deploy:
 
 | Your deploy model | How to correlate | Setup |

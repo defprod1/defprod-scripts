@@ -11,9 +11,16 @@
 #   ./defprod-stamp.sh --stage ship --range "$BEFORE..$AFTER"   # batched deploy: stamp every change in the range
 #
 # Correlation (in order):
-#   1. --key CHG-NN                        explicit
+#   1. --key CHG-NN (or <slug>/CHG-NN)     explicit
 #   2. branch name matching chg/CHG-NN-*   (current branch, or --branch)
-#   3. 'Change: CHG-NN' commit trailers    on HEAD, or across --range
+#   3. 'Change: <slug>/CHG-NN' trailers    on HEAD, or across --range
+#
+# The commit trailer is product-scoped by slug (a bare CHG-NN key is only unique
+# WITHIN a product). Each resolved key carries its owning product slug; the slug
+# is resolved to a productId via getProductBySlug, so one push range spanning
+# several products in a monorepo stamps each against the correct product. A
+# legacy bare 'Change: CHG-NN' trailer (or a branch/--key correlation, which
+# carry no slug) falls back to the configured DEFPROD_PRODUCT_ID.
 #
 # Usage:
 #   ./defprod-stamp.sh --stage <stage> [options]
@@ -28,7 +35,9 @@
 #   --range             Git rev range (e.g. abc123..def456) — stamps EVERY distinct
 #                       change key found in the range's commit trailers
 #   --note              Optional note for the change's event trail
-#   --product-id        Product ID (or DEFPROD_PRODUCT_ID env var, or .defprod/defprod.json)
+#   --product-id        Fallback Product ID for slug-less correlations
+#                       (or DEFPROD_PRODUCT_ID env var, or .defprod/defprod.json).
+#                       Slug-prefixed trailers resolve their own productId.
 #   --api-url           API base URL, e.g. https://app.defprod.com/api/v1/rpc (or DEFPROD_API_URL)
 #   --api-key           API key with read-write product scope (or DEFPROD_API_KEY)
 #   --env-file          Explicit env file to load (else .defprod/defprod.env, legacy .defprod.env)
@@ -159,32 +168,50 @@ API_URL="${DEFPROD_API_URL:-}"
 API_KEY="${DEFPROD_API_KEY:-}"
 PRODUCT_ID="${DEFPROD_PRODUCT_ID:-}"
 
-if [[ -z "$API_URL" || -z "$API_KEY" || -z "$PRODUCT_ID" ]]; then
-    echo "defprod-stamp: missing DEFPROD_API_URL / DEFPROD_API_KEY / DEFPROD_PRODUCT_ID — skipping stamp" >&2
+# API URL + key are always required. PRODUCT_ID is only the fallback for
+# slug-less correlations (bare trailer / branch / --key); slug-prefixed trailers
+# resolve their own productId, so a multi-product monorepo CI need not set it.
+if [[ -z "$API_URL" || -z "$API_KEY" ]]; then
+    echo "defprod-stamp: missing DEFPROD_API_URL / DEFPROD_API_KEY — skipping stamp" >&2
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
 # Correlation: resolve the change key(s) for this stamp
 # ---------------------------------------------------------------------------
+# Emit one `slug|key` token per correlated change (slug empty when the carrier
+# has none). Parses both the product-scoped `Change: <slug>/CHG-NN` trailer and
+# the legacy bare `Change: CHG-NN`.
+parse_trailers() {
+    # stdin: commit message bodies. stdout: deduped `slug|key` tokens.
+    grep -oE '^Change:[[:space:]]+([a-z0-9][a-z0-9-]*/)?CHG-[0-9]+' 2>/dev/null \
+        | sed -E 's/^Change:[[:space:]]+//' \
+        | awk -F/ '{ if (NF == 2) print $1 "|" $2; else print "|" $1 }' \
+        | sort -u
+}
+
 resolve_keys() {
     if [[ -n "$EXPLICIT_KEY" ]]; then
-        echo "$EXPLICIT_KEY"
+        # Accept either a bare key or a <slug>/CHG-NN form.
+        if [[ "$EXPLICIT_KEY" == */* ]]; then
+            echo "${EXPLICIT_KEY%%/*}|${EXPLICIT_KEY##*/}"
+        else
+            echo "|$EXPLICIT_KEY"
+        fi
         return
     fi
     if [[ -n "$RANGE" ]]; then
         # Batched deploys: every distinct change in the range gets stamped.
-        git log --format=%B "$RANGE" 2>/dev/null \
-            | grep -oE '^Change: CHG-[0-9]+' | awk '{print $2}' | sort -u
+        git log --format=%B "$RANGE" 2>/dev/null | parse_trailers
         return
     fi
     local branch="${BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"
     if [[ "$branch" =~ ^chg/(CHG-[0-9]+) ]]; then
-        echo "${BASH_REMATCH[1]}"
+        # Branch names carry no slug — fall back to the configured productId.
+        echo "|${BASH_REMATCH[1]}"
         return
     fi
-    git log -1 --format=%B 2>/dev/null \
-        | grep -oE '^Change: CHG-[0-9]+' | awk '{print $2}' | sort -u
+    git log -1 --format=%B 2>/dev/null | parse_trailers
 }
 
 KEYS=$(resolve_keys)
@@ -193,17 +220,48 @@ if [[ -z "$KEYS" ]]; then
     exit 0
 fi
 
+# Resolve a product slug to its productId via getProductBySlug. Echoes the
+# productId on success, nothing on failure.
+resolve_product_id_from_slug() {
+    local slug="$1"
+    local json
+    json=$(curl -sk -X POST "$API_URL" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $API_KEY" \
+        -d "{\"name\":\"getProductBySlug\",\"input\":{\"slug\":\"$slug\"}}" 2>/dev/null)
+    echo "$json" | jq -r '.data._id // empty' 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Stamp each change (never fail the pipeline)
 # ---------------------------------------------------------------------------
-for KEY in $KEYS; do
+for TOKEN in $KEYS; do
+    SLUG="${TOKEN%%|*}"
+    KEY="${TOKEN#*|}"
+
+    # Product resolution: a slug in the trailer names its own product; otherwise
+    # fall back to the configured DEFPROD_PRODUCT_ID.
+    PID="$PRODUCT_ID"
+    if [[ -n "$SLUG" ]]; then
+        RESOLVED=$(resolve_product_id_from_slug "$SLUG")
+        if [[ -n "$RESOLVED" ]]; then
+            PID="$RESOLVED"
+        else
+            echo "defprod-stamp: slug '$SLUG' (for $KEY) did not resolve to a product — falling back to configured productId" >&2
+        fi
+    fi
+    if [[ -z "$PID" ]]; then
+        echo "defprod-stamp: no productId for $KEY (no slug resolved and DEFPROD_PRODUCT_ID unset) — skipping" >&2
+        continue
+    fi
+
     CHANGE_JSON=$(curl -sk -X POST "$API_URL" \
         -H "Content-Type: application/json" \
         -H "x-api-key: $API_KEY" \
-        -d "{\"name\":\"getChange\",\"input\":{\"productId\":\"$PRODUCT_ID\",\"key\":\"$KEY\"}}" 2>/dev/null)
+        -d "{\"name\":\"getChange\",\"input\":{\"productId\":\"$PID\",\"key\":\"$KEY\"}}" 2>/dev/null)
     CHANGE_ID=$(echo "$CHANGE_JSON" | jq -r '.data._id // empty' 2>/dev/null)
     if [[ -z "$CHANGE_ID" ]]; then
-        echo "defprod-stamp: change $KEY not found in product $PRODUCT_ID — skipping" >&2
+        echo "defprod-stamp: change $KEY not found in product $PID — skipping" >&2
         continue
     fi
 
