@@ -96,7 +96,7 @@ jobs:
 
 Stamps a stage of a DefProd **change record** from a CI/CD hook — so your pipeline reports "built / packaged / staged / shipped" onto the change the commits belong to, and PMs can see delivery progress live in DefProd's Changes view.
 
-The script resolves which change(s) to stamp from your git state, in priority order: `--key` → `--range` (every `Change: <slug>/CHG-NN` trailer in the range) → a `chg/CHG-NN-*` branch name → the `Change: <slug>/CHG-NN` trailer on HEAD. The trailer is **product-scoped by slug**: each key carries its owning product slug, resolved to a productId via `getProductBySlug`, so one push range spanning several products in a monorepo stamps each against the correct product. A legacy bare `Change: CHG-NN` trailer (and the branch / `--key` correlations, which carry no slug) falls back to the configured `DEFPROD_PRODUCT_ID`. Use `--start` to mark a stage in progress and `--cancel` to revert in-progress stage work to not-started (e.g. when a deploy step fails). It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
+The script resolves which change(s) to stamp from your git state, in priority order: `--key` → `--range` (every `Change: <slug>/CHG-NN` trailer in the range) → a `chg/<slug>/CHG-NN-*` (or legacy `chg/CHG-NN-*`) branch name → the `Change: <slug>/CHG-NN` trailer on HEAD. The trailer is **product-scoped by slug**: each key carries its owning product slug, resolved to a productId via `getProductBySlug`, so one push range spanning several products in a monorepo stamps each against the correct product. A slug-prefixed branch (`chg/<slug>/CHG-NN-*`) resolves its own product too; a legacy bare `Change: CHG-NN` trailer, a legacy bare `chg/CHG-NN-*` branch, and `--key` (which carry no slug) fall back to the configured `DEFPROD_PRODUCT_ID`. Use `--start` to mark a stage in progress and `--cancel` to revert in-progress stage work to not-started (e.g. when a deploy step fails). It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
 
 #### Usage
 
@@ -153,7 +153,7 @@ correlation that matches how you deploy:
 
 | Your deploy model | How to correlate | Setup |
 |-------------------|------------------|-------|
-| Per-change branch / PR (`chg/CHG-NN-*`) | branch name (automatic) | none |
+| Per-change branch / PR (`chg/<slug>/CHG-NN-*`, or legacy `chg/CHG-NN-*`) | branch name (automatic) | none |
 | Cloud CI (GitHub Actions, GitLab CI, …) | `--range "$BEFORE..$AFTER"` from the CI's push SHAs (`${{ github.event.before }}..${{ github.event.after }}`, `$CI_COMMIT_BEFORE_SHA..$CI_COMMIT_SHA`) | none — the CI hands you the range |
 | Trunk "deploy latest `main`" from a **persistent** host | a moving baseline tag: stamp `--range "$LAST_DEPLOY..HEAD"`, then `git tag -f last-deploy HEAD` after a successful deploy | seed the tag once |
 

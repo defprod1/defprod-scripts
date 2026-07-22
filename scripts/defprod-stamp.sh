@@ -12,7 +12,7 @@
 #
 # Correlation (in order):
 #   1. --key CHG-NN (or <slug>/CHG-NN)     explicit
-#   2. branch name matching chg/CHG-NN-*   (current branch, or --branch)
+#   2. branch matching chg/<slug>/CHG-NN-* (or legacy chg/CHG-NN-*) (current, or --branch)
 #   3. 'Change: <slug>/CHG-NN' trailers    on HEAD, or across --range
 #
 # The commit trailer is product-scoped by slug (a bare CHG-NN key is only unique
@@ -169,8 +169,9 @@ API_KEY="${DEFPROD_API_KEY:-}"
 PRODUCT_ID="${DEFPROD_PRODUCT_ID:-}"
 
 # API URL + key are always required. PRODUCT_ID is only the fallback for
-# slug-less correlations (bare trailer / branch / --key); slug-prefixed trailers
-# resolve their own productId, so a multi-product monorepo CI need not set it.
+# slug-less correlations (bare trailer / legacy branch / --key); slug-prefixed
+# trailers and slug-prefixed (`chg/<slug>/CHG-NN`) branches resolve their own
+# productId, so a multi-product monorepo CI need not set it.
 if [[ -z "$API_URL" || -z "$API_KEY" ]]; then
     echo "defprod-stamp: missing DEFPROD_API_URL / DEFPROD_API_KEY — skipping stamp" >&2
     exit 0
@@ -206,8 +207,15 @@ resolve_keys() {
         return
     fi
     local branch="${BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"
+    # New form carries the product slug: chg/<slug>/CHG-NN-... The slug pattern is
+    # lowercase/url-safe, so it never matches an uppercase `CHG-` — a legacy
+    # chg/CHG-NN-... branch correctly falls through to the slug-less case below.
+    if [[ "$branch" =~ ^chg/([a-z0-9][a-z0-9-]*)/(CHG-[0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}|${BASH_REMATCH[2]}"
+        return
+    fi
     if [[ "$branch" =~ ^chg/(CHG-[0-9]+) ]]; then
-        # Branch names carry no slug — fall back to the configured productId.
+        # Legacy branch names carry no slug — fall back to the configured productId.
         echo "|${BASH_REMATCH[1]}"
         return
     fi
