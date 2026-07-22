@@ -1,6 +1,6 @@
 {
   "name": "@defprod/scripts",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "CLI utilities for DefProd — sync test status, manage products, and automate your definition-driven workflow",
   "license": "MIT",
   "repository": {
