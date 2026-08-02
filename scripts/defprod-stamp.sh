@@ -26,10 +26,16 @@
 #   ./defprod-stamp.sh --stage <stage> [options]
 #
 #   --stage             Pipeline stage: merge|push|build|package|staging|ship
-#                       (required for --start and finish; ignored by --cancel)
+#                       (required for --start and finish; ignored by --cancel/--fail)
 #   --start             Call startChangeStage (mark the stage in progress)
 #   --cancel            Call cancelChangeStage — cancel the in-progress stage
 #                       work, returning it to not started (ignores --stage)
+#   --fail              Call failChangeStage — report the in-progress stage as
+#                       FAILED (ignores --stage). Use when the stage was attempted
+#                       and did not succeed, e.g. from a CI EXIT trap: the stage is
+#                       recorded as failed rather than reverted to not started, so
+#                       an aborted run is not mistaken for one that never began.
+#                       Pair it with --note carrying the reason (stage, exit code).
 #   --key               Explicit change key (e.g. CHG-07) — skips git correlation
 #   --branch            Branch name to parse instead of the current branch
 #   --range             Git rev range (e.g. abc123..def456) — stamps EVERY distinct
@@ -52,6 +58,18 @@
 # pipeline continues.
 
 set -u
+
+# ---------------------------------------------------------------------------
+# Help — prints the usage block above, verbatim, from this file's own header.
+#
+# Also the capability-probe surface: a CI caller that wants to use a flag this
+# script may be too old to know (`--fail`, say) can grep `--help` for it rather
+# than discovering the gap as an "Unknown argument" exit 2 mid-pipeline. Keep
+# every supported flag named in the header block for that to keep working.
+# ---------------------------------------------------------------------------
+print_usage() {
+    sed -n '25,58p' "$0" | sed -e 's/^# \{0,1\}//' -e 's/^#$//'
+}
 
 # ---------------------------------------------------------------------------
 # Env file loading (exported env vars take precedence) — house convention
@@ -141,6 +159,7 @@ while [[ $# -gt 0 ]]; do
         --stage) STAGE="$2"; shift 2 ;;
         --start) ACTION="startChangeStage"; shift ;;
         --cancel) ACTION="cancelChangeStage"; shift ;;
+        --fail) ACTION="failChangeStage"; shift ;;
         --key) EXPLICIT_KEY="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         --range) RANGE="$2"; shift 2 ;;
@@ -150,11 +169,14 @@ while [[ $# -gt 0 ]]; do
         --api-key) export DEFPROD_API_KEY="$2"; shift 2 ;;
         --env-file) ENV_FILE_EXPLICIT="$2"; shift 2 ;;
         --init) init_env_file ;;
-        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+        -h|--help) print_usage; exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; echo >&2; print_usage >&2; exit 2 ;;
     esac
 done
 
-if [[ -z "$STAGE" && "$ACTION" != "cancelChangeStage" ]]; then
+# cancel and fail both act on whatever stage is in progress — the server resolves
+# it — so neither needs (or uses) --stage.
+if [[ -z "$STAGE" && "$ACTION" != "cancelChangeStage" && "$ACTION" != "failChangeStage" ]]; then
     echo "defprod-stamp: --stage is required (merge|push|build|package|staging|ship)" >&2
     exit 2
 fi
@@ -277,9 +299,10 @@ for TOKEN in $KEYS; do
     if [[ -n "$NOTE" ]]; then
         NOTE_FIELD=",\"note\":$(jq -Rn --arg n "$NOTE" '$n')"
     fi
-    # cancelChangeStage cancels whatever stage is in progress — it takes no
-    # `stage` (the server resolves it); start/finish carry the explicit stage.
-    if [[ "$ACTION" == "cancelChangeStage" ]]; then
+    # cancelChangeStage and failChangeStage both act on whatever stage is in
+    # progress — they take no `stage` (the server resolves it); start/finish
+    # carry the explicit stage.
+    if [[ "$ACTION" == "cancelChangeStage" || "$ACTION" == "failChangeStage" ]]; then
         INPUT="{\"changeId\":\"$CHANGE_ID\"$NOTE_FIELD}"
     else
         INPUT="{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD}"

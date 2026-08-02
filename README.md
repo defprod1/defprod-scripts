@@ -96,7 +96,7 @@ jobs:
 
 Stamps a stage of a DefProd **change record** from a CI/CD hook — so your pipeline reports "built / packaged / staged / shipped" onto the change the commits belong to, and PMs can see delivery progress live in DefProd's Changes view.
 
-The script resolves which change(s) to stamp from your git state, in priority order: `--key` → `--range` (every `Change: <slug>/CHG-NN` trailer in the range) → a `chg/<slug>/CHG-NN-*` (or legacy `chg/CHG-NN-*`) branch name → the `Change: <slug>/CHG-NN` trailer on HEAD. The trailer is **product-scoped by slug**: each key carries its owning product slug, resolved to a productId via `getProductBySlug`, so one push range spanning several products in a monorepo stamps each against the correct product. A slug-prefixed branch (`chg/<slug>/CHG-NN-*`) resolves its own product too; a legacy bare `Change: CHG-NN` trailer, a legacy bare `chg/CHG-NN-*` branch, and `--key` (which carry no slug) fall back to the configured `DEFPROD_PRODUCT_ID`. Use `--start` to mark a stage in progress and `--cancel` to revert in-progress stage work to not-started (e.g. when a deploy step fails). It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
+The script resolves which change(s) to stamp from your git state, in priority order: `--key` → `--range` (every `Change: <slug>/CHG-NN` trailer in the range) → a `chg/<slug>/CHG-NN-*` (or legacy `chg/CHG-NN-*`) branch name → the `Change: <slug>/CHG-NN` trailer on HEAD. The trailer is **product-scoped by slug**: each key carries its owning product slug, resolved to a productId via `getProductBySlug`, so one push range spanning several products in a monorepo stamps each against the correct product. A slug-prefixed branch (`chg/<slug>/CHG-NN-*`) resolves its own product too; a legacy bare `Change: CHG-NN` trailer, a legacy bare `chg/CHG-NN-*` branch, and `--key` (which carry no slug) fall back to the configured `DEFPROD_PRODUCT_ID`. Use `--start` to mark a stage in progress, `--fail` to record it as failed when the attempt did not succeed (the usual case for a deploy step that aborts), and `--cancel` to revert in-progress stage work to not-started when it was deliberately abandoned. Prefer `--fail` over `--cancel` in a failure trap: cancelling says the work was never started, which makes an aborted run indistinguishable from one that never began. It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
 
 #### Usage
 
@@ -107,8 +107,11 @@ defprod-stamp --stage build
 # Mark 'build' in progress at the head of the pipeline (the live pulse)
 defprod-stamp --stage build --start
 
-# Cancel the in-progress stage (e.g. from a failure trap) — returns it to not started
-defprod-stamp --cancel --note "deploy aborted"
+# Record the in-progress stage as FAILED (e.g. from a failure trap)
+defprod-stamp --fail --note "deploy aborted during 'package' (exit 1)"
+
+# Cancel the in-progress stage — deliberate abandonment, returns it to not started
+defprod-stamp --cancel --note "superseded, picking this up next week"
 
 # Batched deploy: stamp 'ship' for every change in the deployed range
 defprod-stamp --stage ship --range "$BEFORE_SHA..$AFTER_SHA"
@@ -118,9 +121,11 @@ defprod-stamp --stage ship --range "$BEFORE_SHA..$AFTER_SHA"
 
 | Option         | Description                                                          | Default        |
 |----------------|----------------------------------------------------------------------|----------------|
-| `--stage`      | Pipeline stage: `merge`/`push`/`build`/`package`/`staging`/`ship` (required for `--start`/finish; ignored by `--cancel`) | — |
+| `--stage`      | Pipeline stage: `merge`/`push`/`build`/`package`/`staging`/`ship` (required for `--start`/finish; ignored by `--cancel`/`--fail`) | — |
 | `--start`      | Mark the stage in progress instead of finished                        | finish         |
+| `--fail`       | Record the in-progress stage as failed — it was attempted and did not succeed | —      |
 | `--cancel`     | Cancel the in-progress stage work (returns it to not started)         | —              |
+| `--help`       | Print usage and exit 0 (also lets a caller probe for flag support)    | —              |
 | `--key`        | Explicit change key (e.g. `CHG-07`) — skips git correlation           | —              |
 | `--branch`     | Branch name to parse instead of the current branch                    | current branch |
 | `--range`      | Git rev range — stamps every change found in its commit trailers      | —              |
