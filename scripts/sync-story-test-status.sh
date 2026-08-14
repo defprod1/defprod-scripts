@@ -23,6 +23,14 @@
 #                       harness is one of 'playwright', 'vitest', 'jest', 'system'.
 #                       Overrides --test-dir and --playwright-config when set.
 #                       Also readable from DEFPROD_TEST_SUITES env var.
+#   --adopt-report      Parse a report another runner already produced instead of
+#                       running that suite. Repeatable. Format:
+#                       '<harness>:<dir>:<path>[,<path>...]' — <harness>:<dir> must
+#                       match a --test-suites entry; several comma-separated paths
+#                       are unioned (Playwright split across passes). Coverage is
+#                       still walked from <dir>, so a covered story missing from the
+#                       report keeps its previous result instead of being nulled.
+#                       Also readable from DEFPROD_ADOPT_REPORTS (';'-separated).
 #   --area-key          Narrow scope to a single product area (e.g. CORE)
 #   --env-file          Explicit env file to load (else .defprod/defprod.env, legacy .defprod.env)
 #   --dry-run           Print payload without posting
@@ -221,6 +229,7 @@ PW_CONFIG="${DEFPROD_PLAYWRIGHT_CONFIG:-./playwright.config.ts}"
 # config declares).
 PW_PROJECTS="${DEFPROD_PLAYWRIGHT_PROJECTS-chromium}"
 TEST_SUITES_RAW="${DEFPROD_TEST_SUITES:-}"
+ADOPT_REPORTS_RAW="${DEFPROD_ADOPT_REPORTS:-}"
 AREA_KEY="${DEFPROD_AREA_KEY:-}"
 DRY_RUN=false
 SKIP_RUN=false
@@ -234,13 +243,16 @@ while [[ $# -gt 0 ]]; do
         --playwright-config) PW_CONFIG="$2"; shift 2 ;;
         --project)      PW_PROJECTS="$2"; shift 2 ;;
         --test-suites)  TEST_SUITES_RAW="$2"; shift 2 ;;
+        --adopt-report) ADOPT_REPORTS_RAW="${ADOPT_REPORTS_RAW:+${ADOPT_REPORTS_RAW};}$2"; shift 2 ;;
         --area-key)     AREA_KEY="$2"; shift 2 ;;
         --env-file)     shift 2 ;;  # already handled in early parse
         --dry-run)      DRY_RUN=true; shift ;;
         --skip-run)     SKIP_RUN=true; shift ;;
         --init)         run_init ;;
         --version|-v)   echo "defprod-sync-tests $VERSION"; exit 0 ;;
-        -h|--help)      sed -n '3,32p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        # Print the whole header block rather than a hardcoded line range — the
+        # range silently truncated --help every time an option was added.
+        -h|--help)      sed -n '3,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^# \?//'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -258,6 +270,49 @@ if [[ -n "$TEST_SUITES_RAW" ]]; then
 else
     # Back-compat: single Playwright suite from --test-dir / --playwright-config
     TEST_SUITES=("playwright:${TEST_DIR}:${PW_CONFIG}")
+fi
+
+# ---- Resolve adopted reports ----
+#
+# An adopted report is a harness-native results file some OTHER runner already
+# produced — typically a nightly full-suite run. The suite is then PARSED but
+# not RUN: coverage still comes from walking the test directory, so a story
+# whose spec exists but is absent from the report stays `covered` and keeps its
+# previous result rather than being nulled (see the carry-forward in Step 4).
+#
+# This is what lets a long full-suite run feed DefProd without paying for the
+# suites twice.
+# Keyed by '<harness>:<dir>' — the same pair that identifies a suite in
+# --test-suites, and the only key that works: a monorepo commonly has SEVERAL
+# vitest suites (REST, MCP, CLI), so harness alone would collide and one
+# report would be adopted by all three.
+declare -A ADOPTED_REPORTS=()
+if [[ -n "$ADOPT_REPORTS_RAW" ]]; then
+    declare -a _adopt_entries
+    IFS=';' read -ra _adopt_entries <<< "$ADOPT_REPORTS_RAW"
+    for _entry in "${_adopt_entries[@]}"; do
+        [[ -z "$_entry" ]] && continue
+        _adopt_harness="${_entry%%:*}"
+        _adopt_rest="${_entry#*:}"
+        _adopt_dir="${_adopt_rest%%:*}"
+        _adopt_paths="${_adopt_rest#*:}"
+        if [[ -z "$_adopt_harness" || -z "$_adopt_dir" || -z "$_adopt_paths" \
+              || "$_adopt_harness" == "$_entry" || "$_adopt_dir" == "$_adopt_rest" ]]; then
+            echo "Error: --adopt-report expects '<harness>:<dir>:<path>[,<path>...]', got '$_entry'" >&2
+            exit 1
+        fi
+        # Every named file must exist. A missing report would parse to zero
+        # results and, without this, quietly report a whole suite as unrun —
+        # so fail loudly rather than posting a hole.
+        IFS=',' read -ra _adopt_check <<< "$_adopt_paths"
+        for _p in "${_adopt_check[@]}"; do
+            if [[ ! -f "$_p" ]]; then
+                echo "Error: --adopt-report file not found: $_p" >&2
+                exit 1
+            fi
+        done
+        ADOPTED_REPORTS["${_adopt_harness}:${_adopt_dir}"]="$_adopt_paths"
+    done
 fi
 
 # ---- Step 1: Fetch product definition ----
@@ -282,22 +337,26 @@ if [[ -n "$AREA_KEY" ]]; then
     STORIES_JSON=$(echo "$STORIES_JSON" | jq --arg key "$AREA_KEY" '{ data: [.data[] | select(.key | startswith($key + "-"))] }')
 fi
 
-# Coverage-only mode (--skip-run) must NOT clobber pass/fail results it did not
-# measure. Fetch the product's existing per-story statuses so Step 4 can carry
-# the result fields forward — a coverage-only sync then updates ONLY coverage +
-# testExemptReason, leaving result/totals/lastRunAt as the server already has
-# them. (A full run replaces them with freshly-measured values.)
-EXISTING_STATUSES_JSON='{"data":[]}'
-if [[ "$SKIP_RUN" == "true" ]]; then
-    EXISTING_STATUSES_JSON=$(curl -sk -X POST "$API_URL" \
-        -H "Content-Type: application/json" \
-        -H "x-api-key: $API_KEY" \
-        -d "{\"name\":\"getStoryTestStatusForProduct\",\"input\":{\"productId\":\"$PRODUCT_ID\"}}" 2>/dev/null)
-    # Tolerate any non-array/error shape — fall back to empty so a fetch failure
-    # never turns into wiping results.
-    if ! echo "$EXISTING_STATUSES_JSON" | jq -e '.data | type == "array"' >/dev/null 2>&1; then
-        EXISTING_STATUSES_JSON='{"data":[]}'
-    fi
+# A sync must NOT clobber pass/fail it did not measure. Fetch the product's
+# existing per-story statuses so Step 4 can carry the result fields forward in
+# the two cases where this run has nothing fresh to say about a story:
+#
+#   1. --skip-run — no suite ran at all, so NOTHING was measured.
+#   2. A COVERED story absent from the results. Its spec exists, so silence is
+#      not evidence of anything: the spec may have been quarantined, filtered
+#      out by a grep, or excluded from an adopted report. Nulling it would make
+#      a full run look like a regression to "never tested" every single night.
+#
+# An UNCOVERED story is different: its spec is gone, so an old result is stale
+# by definition and is allowed to fall away.
+EXISTING_STATUSES_JSON=$(curl -sk -X POST "$API_URL" \
+    -H "Content-Type: application/json" \
+    -H "x-api-key: $API_KEY" \
+    -d "{\"name\":\"getStoryTestStatusForProduct\",\"input\":{\"productId\":\"$PRODUCT_ID\"}}" 2>/dev/null)
+# Tolerate any non-array/error shape — fall back to empty so a fetch failure
+# never turns into wiping results.
+if ! echo "$EXISTING_STATUSES_JSON" | jq -e '.data | type == "array"' >/dev/null 2>&1; then
+    EXISTING_STATUSES_JSON='{"data":[]}'
 fi
 
 AREA_COUNT=$(echo "$AREAS_JSON" | jq '.data | length')
@@ -472,12 +531,31 @@ run_playwright_suite() {
     fi
 }
 
-# parse_playwright_results <results_json> <areas_root>
+# parse_playwright_results <results_json[,results_json...]> <areas_root>
 # Reads the Playwright JSON reporter output and emits per-story status objects
 # (one JSON array on stdout) matching the per-story-results.json schema.
+#
+# Accepts a COMMA-SEPARATED list of report files, whose suites are unioned. A
+# run may legitimately be split across several reports — the DefProd nightly,
+# for one, runs a parallel pass and then an @exclusive single-worker pass and
+# writes one report each. Parsing only the first would mark every story in the
+# second as unrun.
 parse_playwright_results() {
-    local results_json="$1"
+    local results_spec="$1"
     local areas_root="$2"
+    local results_json="$results_spec"
+
+    if [[ "$results_spec" == *,* ]]; then
+        local -a _files=() _present=()
+        IFS=',' read -ra _files <<< "$results_spec"
+        for _f in "${_files[@]}"; do
+            [[ -f "$_f" ]] && _present+=("$_f")
+        done
+        [[ ${#_present[@]} -gt 0 ]] || { echo "[]"; return 0; }
+        results_json="$RESULTS_DIR/playwright-merged.json"
+        jq -s '{ suites: (map(.suites // []) | add) }' "${_present[@]}" > "$results_json" \
+            || { echo "[]"; return 0; }
+    fi
 
     [[ -f "$results_json" ]] || { echo "[]"; return 0; }
 
@@ -502,7 +580,12 @@ parse_playwright_results() {
             # Story keys may have multiple dash-segments (e.g. CORE-MOB-10) —
             # use a non-greedy quantifier on the dash-segment so the trailing
             # /<file>.spec.ts portion can still be matched.
-            (.file | capture("/(?<areaKey>[A-Z0-9_]+)/(?<storyKey>[A-Z0-9_]+(?:-[A-Z0-9_]+)+)/[^/]+\\.spec\\.ts$")) as $m |
+            # (?:^|/) — Playwright reports `file` relative to the common ancestor
+            # of the discovered specs, NOT to testDir. Where every spec lives under
+            # one story tree that ancestor collapses onto it, so the path can BEGIN
+            # at the area segment with no leading slash. Requiring one matched
+            # nothing and reported a whole suite as unrun.
+            (.file | capture("(?:^|/)(?<areaKey>[A-Z0-9_]+)/(?<storyKey>[A-Z0-9_]+(?:-[A-Z0-9_]+)+)/[^/]+\\.spec\\.ts$")) as $m |
             select($m != null) |
             . + { areaKey: $m.areaKey, storyKey: $m.storyKey }
         ] |
@@ -598,7 +681,7 @@ parse_jest_compat_results() {
         # or .../<AREA>/<STORY-KEY>/<name>.test.ts.
         [$files[] |
             # Story keys may have multiple dash-segments (e.g. CORE-MOB-10).
-            (.name | capture("/(?<areaKey>[A-Z0-9_]+)/(?<storyKey>[A-Z0-9_]+(?:-[A-Z0-9_]+)+)/[^/]+\\.test\\.ts$")) as $m |
+            (.name | capture("(?:^|/)(?<areaKey>[A-Z0-9_]+)/(?<storyKey>[A-Z0-9_]+(?:-[A-Z0-9_]+)+)/[^/]+\\.test\\.ts$")) as $m |
             select($m != null) |
             {
                 areaKey: $m.areaKey,
@@ -665,7 +748,7 @@ parse_system_results() {
         ($r[0].testResults // []) as $files |
 
         [$files[] |
-            (.name | capture("/(?<storyKey>[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\\.test\\.ts$")) as $m |
+            (.name | capture("(?:^|/)(?<storyKey>[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\\.test\\.ts$")) as $m |
             select($m != null) |
             {
                 areaKey: ($m.storyKey | split("-")[0]),
@@ -740,28 +823,44 @@ for suite_spec in "${TEST_SUITES[@]}"; do
     suite_results_raw="$RESULTS_DIR/${suite_harness}-raw.json"
     suite_results_parsed="$RESULTS_DIR/${suite_harness}-parsed.json"
 
+    # Adopted report: some other runner already produced this suite's results,
+    # so parse those instead of running the suite again.
+    suite_adopted="${ADOPTED_REPORTS[${suite_harness}:${suite_dir}]:-}"
+    if [[ -n "$suite_adopted" ]]; then
+        suite_results_raw="$suite_adopted"
+        echo "  Adopting report: $suite_adopted"
+    fi
+
     case "$suite_harness" in
         playwright)
-            echo "  Running Playwright..."
-            run_playwright_suite "$suite_dir" "$suite_config" "$suite_covered_file" "$suite_results_raw"
+            if [[ -z "$suite_adopted" ]]; then
+                echo "  Running Playwright..."
+                run_playwright_suite "$suite_dir" "$suite_config" "$suite_covered_file" "$suite_results_raw"
+            fi
             areas_root="$suite_dir"
             [[ -d "$suite_dir/areas" ]] && areas_root="$suite_dir/areas"
             parse_playwright_results "$suite_results_raw" "$areas_root" > "$suite_results_parsed"
             ;;
         vitest)
-            echo "  Running Vitest..."
-            run_vitest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
+            if [[ -z "$suite_adopted" ]]; then
+                echo "  Running Vitest..."
+                run_vitest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
+            fi
             parse_jest_compat_results "$suite_results_raw" > "$suite_results_parsed"
             ;;
         system)
             # Filename-keyed unit tests, run via Vitest; attribute by basename.
-            echo "  Running Vitest (system)..."
-            run_vitest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
+            if [[ -z "$suite_adopted" ]]; then
+                echo "  Running Vitest (system)..."
+                run_vitest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
+            fi
             parse_system_results "$suite_results_raw" > "$suite_results_parsed"
             ;;
         jest)
-            echo "  Running Jest..."
-            run_jest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
+            if [[ -z "$suite_adopted" ]]; then
+                echo "  Running Jest..."
+                run_jest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
+            fi
             parse_jest_compat_results "$suite_results_raw" > "$suite_results_parsed"
             ;;
         *)
@@ -797,11 +896,14 @@ done
 
 # Start from the API story list, then enrich each story with coverage + result.
 #
-# Result fields come from a freshly-run suite ($r) in a normal run. In
-# coverage-only mode (--skip-run) there is no fresh result, so we carry the
-# server's EXISTING result forward ($e) rather than nulling it — a coverage-only
-# sync updates ONLY coverage + testExemptReason and never destroys measured
-# pass/fail. A truly new/uncovered story with neither stays null.
+# Result fields come from a freshly-run suite ($r) where this run measured one.
+# Where it did not, the server's EXISTING result ($e) is carried forward rather
+# than nulled — see the fetch above for why. That covers --skip-run (nothing ran)
+# and any COVERED story missing from the results (quarantined, grep-filtered, or
+# absent from an adopted report).
+#
+# An UNCOVERED story is never carried forward: no spec means no current claim,
+# so a stale result is allowed to fall away. A story with neither stays null.
 STATUSES_FILE="$RESULTS_DIR/statuses.json"
 echo "$EXISTING_STATUSES_JSON" | jq '.data // []' > "$RESULTS_DIR/existing-statuses.json"
 SKIP_RUN_JSON=$([[ "$SKIP_RUN" == "true" ]] && echo true || echo false)
@@ -848,7 +950,7 @@ echo "$STORIES_JSON" | jq \
                 failedTestTitles: $r.failedTestTitles,
                 lastRunAt: $r.lastRunAt
             }
-        elif ( $skipRun and $e != null ) then
+        elif ( $e != null and ($skipRun or .coverage == "covered") ) then
             . + {
                 result: $e.result,
                 totalTests: $e.totalTests,

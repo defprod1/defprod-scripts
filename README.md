@@ -237,6 +237,34 @@ Use `system` for unit tests filed by code module rather than by product area: th
 directory says which module the test lives in, so the story link is carried by the
 filename instead. The area is taken from the story-key prefix.
 
+### Adopting a report from a run you already did
+
+If CI already runs your suites — a nightly full-suite job, say — you do not want the
+sync to run them a second time. `--adopt-report` parses a report that run already
+produced:
+
+```bash
+npx @defprod/scripts defprod-sync-tests \
+  --adopt-report "playwright:apps/web/e2e:ci/e2e-report.json,ci/e2e-exclusive.json" \
+  --adopt-report "vitest:apps/api/tests/areas:ci/api-report.json"
+```
+
+- The `<harness>:<dir>` prefix must match a `testSuites` entry — `<dir>` is part of the
+  key because a repo often has several suites on the same harness.
+- Several comma-separated paths are **unioned**, for a run split across passes (for
+  example a parallel pass plus a single-worker pass for tests that must not run
+  concurrently). Adopting only one would report the rest as unrun.
+- Coverage is still walked from `<dir>`, so a story whose spec exists but is absent
+  from the report — quarantined, or filtered out by a grep — **keeps its previous
+  result** rather than being reset. A story whose spec is gone is reset, since there
+  is nothing left making a claim about it.
+- Naming a file that does not exist is an error, not an empty parse. Reporting a whole
+  suite as untested because of a typo is worse than failing.
+
+Generate the reports with each harness's JSON reporter — `--reporter=json` for
+Playwright, `--reporter=json --outputFile.json=…` for Vitest. Keep your normal
+reporter alongside it if something else reads that output.
+
 ## License
 
 MIT
