@@ -20,13 +20,15 @@
 #                       or DEFPROD_PLAYWRIGHT_PROJECTS). Set empty to run every project the
 #                       Playwright config declares.
 #   --test-suites       Multi-suite mode: ';'-separated list of 'harness:dir:config' entries.
-#                       harness is one of 'playwright', 'vitest', 'jest'.
+#                       harness is one of 'playwright', 'vitest', 'jest', 'system'.
 #                       Overrides --test-dir and --playwright-config when set.
 #                       Also readable from DEFPROD_TEST_SUITES env var.
 #   --area-key          Narrow scope to a single product area (e.g. CORE)
 #   --env-file          Explicit env file to load (else .defprod/defprod.env, legacy .defprod.env)
 #   --dry-run           Print payload without posting
-#   --skip-run          Check coverage only, do not run tests
+#   --skip-run          Coverage only: refresh coverage + test-exemptions WITHOUT
+#                       running tests. Existing pass/fail results are preserved
+#                       (fetched and carried forward), never nulled.
 #   --init              Interactive setup — creates .defprod/ config
 #   --version, -v       Print version and exit
 #
@@ -39,7 +41,7 @@ set -euo pipefail
 
 # ---- Helpers ----
 
-VERSION="1.1.0" # baked by prepublish
+VERSION="dev" # baked by prepublish
 
 load_env_file() {
     local file="$1"
@@ -158,7 +160,7 @@ DEFPROD_API_KEY=$input_api_key
 # You can set it here or as "testSuites" in defprod.json. Format:
 #   harness:dir:config[;harness:dir:config...]
 # Example covering Playwright e2e + Vitest API + Vitest MCP + Jest CLI:
-# DEFPROD_TEST_SUITES=playwright:apps/defprod-front/e2e:apps/defprod-front/playwright.config.ts;vitest:apps/defprod-back/tests/areas:apps/defprod-back/vitest.config.api.ts;vitest:apps/defprod-mcp/tests/areas:apps/defprod-mcp/vitest.config.mcp.ts;jest:apps/defprod-cli/tests/areas:apps/defprod-cli/jest.config.areas.ts
+# DEFPROD_TEST_SUITES=playwright:apps/defprod-front/e2e:apps/defprod-front/playwright.config.ts;vitest:apps/defprod-back/tests/areas:apps/defprod-back/vitest.config.api.ts;vitest:apps/defprod-mcp/tests/areas:apps/defprod-mcp/vitest.config.mcp.ts;vitest:apps/defprod-cli/tests/areas:apps/defprod-cli/vitest.config.areas.ts
 EOF
 
     echo ""
@@ -280,6 +282,24 @@ if [[ -n "$AREA_KEY" ]]; then
     STORIES_JSON=$(echo "$STORIES_JSON" | jq --arg key "$AREA_KEY" '{ data: [.data[] | select(.key | startswith($key + "-"))] }')
 fi
 
+# Coverage-only mode (--skip-run) must NOT clobber pass/fail results it did not
+# measure. Fetch the product's existing per-story statuses so Step 4 can carry
+# the result fields forward — a coverage-only sync then updates ONLY coverage +
+# testExemptReason, leaving result/totals/lastRunAt as the server already has
+# them. (A full run replaces them with freshly-measured values.)
+EXISTING_STATUSES_JSON='{"data":[]}'
+if [[ "$SKIP_RUN" == "true" ]]; then
+    EXISTING_STATUSES_JSON=$(curl -sk -X POST "$API_URL" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $API_KEY" \
+        -d "{\"name\":\"getStoryTestStatusForProduct\",\"input\":{\"productId\":\"$PRODUCT_ID\"}}" 2>/dev/null)
+    # Tolerate any non-array/error shape — fall back to empty so a fetch failure
+    # never turns into wiping results.
+    if ! echo "$EXISTING_STATUSES_JSON" | jq -e '.data | type == "array"' >/dev/null 2>&1; then
+        EXISTING_STATUSES_JSON='{"data":[]}'
+    fi
+fi
+
 AREA_COUNT=$(echo "$AREAS_JSON" | jq '.data | length')
 STORY_COUNT=$(echo "$STORIES_JSON" | jq '.data | length')
 echo "  Found $AREA_COUNT areas / $STORY_COUNT user stories"
@@ -305,12 +325,39 @@ echo "[]" > "$RESULTS_DIR/covered-paths.json"
 # ---- Per-suite helpers ----
 
 # walk_suite_coverage <harness> <dir>
-# Echoes "<areaKey>/<storyKey>" lines for every story dir under <dir>/[areas/]
-# that contains at least one matching test file.
+# Echoes "<areaKey>/<storyKey>" lines for every story covered by <dir>.
+#
+# Two coverage conventions:
+#   - Directory-keyed (playwright/vitest/jest): a story is covered when
+#     <dir>/[areas/]<AREA>/<STORY-KEY>/ contains a matching test file. Used by
+#     the integration-suite layout (e2e, REST, MCP, CLI).
+#   - Filename-keyed (system): a story is covered when a file named
+#     <STORY-KEY>.test.ts exists anywhere under <dir>. Used for `system`-surface
+#     stories (event handlers, scheduled jobs, reactive fan-out) whose unit tests
+#     live under apps/defprod-back/src/tests/modules/<code-module>/ — the
+#     directory is the CODE MODULE, not the product area, so the product link is
+#     carried by the filename. The area is the story-key prefix.
 walk_suite_coverage() {
     local harness="$1"
     local dir="$2"
     local glob
+
+    # System surface: filename-keyed detection (directory = code module).
+    if [[ "$harness" == "system" ]]; then
+        [[ -d "$dir" ]] || return 0
+        local file base story_key area_key
+        while IFS= read -r file; do
+            base=$(basename "$file" .test.ts)
+            # Match a story-key filename: AREA-123 or AREA-MOB-10 (uppercase,
+            # dash-delimited). Skips module-named files like user-events.test.ts.
+            [[ "$base" =~ ^[A-Z][A-Z0-9]*(-[A-Z0-9]+)+$ ]] || continue
+            story_key="$base"
+            area_key="${story_key%%-*}"
+            [[ -n "$AREA_KEY" ]] && [[ "$area_key" != "$AREA_KEY" ]] && continue
+            echo "$area_key/$story_key"
+        done < <(find "$dir" -type f -name '*.test.ts' 2>/dev/null)
+        return 0
+    fi
 
     case "$harness" in
         playwright) glob="*.spec.ts" ;;
@@ -484,7 +531,11 @@ parse_playwright_results() {
             ($total - $passed - $flaky) as $failed |
             ($skippedSpecs | length) as $skipped |
 
-            (if $failed > 0 then "failing"
+            # An all-skipped story (no active specs) has NO pass/fail outcome — it
+            # must be null, not "passing". Defaulting 0-active to "passing" wrongly
+            # painted all-skipped stories green on the dashboard.
+            (if $total == 0 then null
+             elif $failed > 0 then "failing"
              elif $flaky > 0 then "flaky"
              else "passing" end) as $result |
 
@@ -599,6 +650,66 @@ parse_jest_compat_results() {
     ' <<< '{}'
 }
 
+# parse_system_results <results_json>
+# Like parse_jest_compat_results, but for filename-keyed `system` suites: the
+# (areaKey, storyKey) is read from the test file's BASENAME (<STORY-KEY>.test.ts)
+# rather than its directory path, because system tests live under code-module
+# directories, not areas/<AREA>/<STORY>/. Files not named like a story key
+# (e.g. user-events.test.ts) are ignored.
+parse_system_results() {
+    local results_json="$1"
+
+    [[ -f "$results_json" ]] || { echo "[]"; return 0; }
+
+    jq --slurpfile r "$results_json" '
+        ($r[0].testResults // []) as $files |
+
+        [$files[] |
+            (.name | capture("/(?<storyKey>[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\\.test\\.ts$")) as $m |
+            select($m != null) |
+            {
+                areaKey: ($m.storyKey | split("-")[0]),
+                storyKey: $m.storyKey,
+                tests: (.assertionResults // [])
+            }
+        ] |
+
+        group_by(.areaKey + "/" + .storyKey) |
+
+        [.[] |
+            (.[0].areaKey) as $areaKey |
+            (.[0].storyKey) as $storyKey |
+            ([.[] | .tests[]]) as $allTests |
+
+            ($allTests | length) as $total |
+            ([$allTests[] | select(.status == "passed")] | length) as $passed |
+            ([$allTests[] | select(.status == "failed")] | length) as $failed |
+            ([$allTests[] | select(.status == "pending" or .status == "skipped" or .status == "todo")] | length) as $skipped |
+
+            0 as $flaky |
+
+            (if $failed > 0 then "failing"
+             elif $passed > 0 then "passing"
+             else null end) as $result |
+
+            ([$allTests[] | select(.status == "failed") | .title] | unique) as $failedTitles |
+
+            {
+                areaKey: $areaKey,
+                storyKey: $storyKey,
+                result: $result,
+                totalTests: $total,
+                passedTests: $passed,
+                failedTests: $failed,
+                flakyTests: $flaky,
+                skippedTests: $skipped,
+                failedTestTitles: $failedTitles,
+                lastRunAt: (now | todate)
+            }
+        ]
+    ' <<< '{}'
+}
+
 # ---- Step 2 + 3: per-suite coverage + run + parse ----
 
 for suite_spec in "${TEST_SUITES[@]}"; do
@@ -642,6 +753,12 @@ for suite_spec in "${TEST_SUITES[@]}"; do
             run_vitest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
             parse_jest_compat_results "$suite_results_raw" > "$suite_results_parsed"
             ;;
+        system)
+            # Filename-keyed unit tests, run via Vitest; attribute by basename.
+            echo "  Running Vitest (system)..."
+            run_vitest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
+            parse_system_results "$suite_results_raw" > "$suite_results_parsed"
+            ;;
         jest)
             echo "  Running Jest..."
             run_jest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
@@ -679,22 +796,39 @@ done
 # ---- Step 4: Build per-story statuses array ----
 
 # Start from the API story list, then enrich each story with coverage + result.
+#
+# Result fields come from a freshly-run suite ($r) in a normal run. In
+# coverage-only mode (--skip-run) there is no fresh result, so we carry the
+# server's EXISTING result forward ($e) rather than nulling it — a coverage-only
+# sync updates ONLY coverage + testExemptReason and never destroys measured
+# pass/fail. A truly new/uncovered story with neither stays null.
 STATUSES_FILE="$RESULTS_DIR/statuses.json"
+echo "$EXISTING_STATUSES_JSON" | jq '.data // []' > "$RESULTS_DIR/existing-statuses.json"
+SKIP_RUN_JSON=$([[ "$SKIP_RUN" == "true" ]] && echo true || echo false)
 echo "$STORIES_JSON" | jq \
     --slurpfile covered "$RESULTS_DIR/covered-paths.json" \
-    --slurpfile results "$RESULTS_DIR/per-story-results.json" '
+    --slurpfile results "$RESULTS_DIR/per-story-results.json" \
+    --slurpfile existing "$RESULTS_DIR/existing-statuses.json" \
+    --argjson skipRun "$SKIP_RUN_JSON" '
     [.data[] |
         . as $story |
         ($story.key | split("-")[0]) as $areaKey |
         ($areaKey + "/" + $story.key) as $path |
         ([$results[0][] | select(.areaKey == $areaKey and .storyKey == $story.key)] | first) as $r |
+        ([$existing[0][] | select(.userStoryId == $story._id)] | first) as $e |
         ({
             userStoryId: $story._id,
             storyKey: $story.key,
             areaId: ($story.areaId // ""),
             areaKey: $areaKey,
             storyTitle: ($story.title // null),
-            coverage: (if ($covered[0] | index($path)) then "covered" else "uncovered" end),
+            coverage: (
+                if (($story.testExemptReason // "") | length) > 0 then "exempt"
+                elif ($covered[0] | index($path)) then "covered"
+                else "uncovered" end
+            ),
+            testExemptReason: ($story.testExemptReason // null),
+            storyStatus: ($story.status // null),
             result: null,
             totalTests: null,
             passedTests: null,
@@ -713,6 +847,17 @@ echo "$STORIES_JSON" | jq \
                 skippedTests: $r.skippedTests,
                 failedTestTitles: $r.failedTestTitles,
                 lastRunAt: $r.lastRunAt
+            }
+        elif ( $skipRun and $e != null ) then
+            . + {
+                result: $e.result,
+                totalTests: $e.totalTests,
+                passedTests: $e.passedTests,
+                failedTests: $e.failedTests,
+                flakyTests: $e.flakyTests,
+                skippedTests: $e.skippedTests,
+                failedTestTitles: ($e.failedTestTitles // []),
+                lastRunAt: $e.lastRunAt
             }
         else . end
     ]' > "$STATUSES_FILE"

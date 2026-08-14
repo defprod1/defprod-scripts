@@ -214,6 +214,29 @@ Any config key can also be supplied as an environment variable or CLI flag:
 | `DEFPROD_TEST_SUITES`        | Multi-suite spec                     | `testSuites`           |
 | `DEFPROD_AREA_KEY`           | Restrict to a single area            | —                      |
 
+### Multi-suite mode
+
+One sync can cover several harnesses at once — a Playwright e2e suite plus non-UI
+integration suites (REST, MCP, CLI) and unit tests. Set `testSuites` (or
+`DEFPROD_TEST_SUITES`) to a `;`-separated list of `harness:dir:config` entries:
+
+```
+playwright:apps/web/e2e:apps/web/playwright.config.ts;vitest:apps/api/tests/areas:apps/api/vitest.config.ts
+```
+
+`harness` is one of:
+
+| Harness      | How a story is matched to a test                                              |
+|--------------|-------------------------------------------------------------------------------|
+| `playwright` | **Directory-keyed** — `<dir>/[areas/]<AREA>/<STORY-KEY>/` holds the spec        |
+| `vitest`     | Directory-keyed, as above                                                       |
+| `jest`       | Directory-keyed, as above                                                       |
+| `system`     | **Filename-keyed** — a file named `<STORY-KEY>.test.ts` anywhere under `<dir>` |
+
+Use `system` for unit tests filed by code module rather than by product area: the
+directory says which module the test lives in, so the story link is carried by the
+filename instead. The area is taken from the story-key prefix.
+
 ## License
 
 MIT
