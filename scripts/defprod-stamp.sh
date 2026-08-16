@@ -22,6 +22,7 @@
 # legacy bare 'Change: CHG-NN' trailer (or a branch/--key correlation, which
 # carry no slug) falls back to the configured DEFPROD_PRODUCT_ID.
 #
+# --- usage:begin ---
 # Usage:
 #   ./defprod-stamp.sh --stage <stage> [options]
 #
@@ -40,6 +41,19 @@
 #   --branch            Branch name to parse instead of the current branch
 #   --range             Git rev range (e.g. abc123..def456) — stamps EVERY distinct
 #                       change key found in the range's commit trailers
+#   --list-changes      Correlation-only mode: print the change(s) the correlation
+#                       resolves, one JSON object per line on stdout, and stamp
+#                       NOTHING. Use it when something downstream must act on the
+#                       set of changes a git range carries — recording a deployment
+#                       run, generating release notes or a changelog — rather than
+#                       reimplementing trailer parsing, slug→productId resolution
+#                       and the change lookup in a second script that will drift.
+#                       Each line: {"key","slug","productId","changeId"}; slug is
+#                       null for a slug-less correlation. stdout carries data only,
+#                       every diagnostic goes to stderr, so a caller can read the
+#                       list without filtering. Cannot be combined with
+#                       --stage/--start/--cancel/--fail/--note. Needs only read
+#                       access — it calls no mutating use case.
 #   --note              Optional note for the change's event trail
 #   --product-id        Fallback Product ID for slug-less correlations
 #                       (or DEFPROD_PRODUCT_ID env var, or .defprod/defprod.json).
@@ -53,9 +67,20 @@
 # --env-file/DEFPROD_ENV_FILE > .defprod/defprod.env (git-ignored secrets) >
 # .defprod/defprod.json (committed: productId, apiUrl) > legacy .defprod.env.
 #
-# Exit code: ALWAYS 0 unless invoked with bad arguments. A missed stamp is a
-# visibility bug, not a deploy blocker — failures are logged to stderr and the
-# pipeline continues.
+# Exit codes:
+#   0  Success. For --list-changes, the correlation COMPLETED — the list may
+#      still be legitimately empty (the range carried no tracked change).
+#   2  Bad arguments.
+#   3  --list-changes only: the correlation could NOT be completed (unreadable
+#      rev range, missing API config, or a key that did not resolve to a change).
+#      stdout is an incomplete answer and must not be treated as the answer.
+#
+# Stamping NEVER returns 3: a missed stamp is a visibility bug, not a deploy
+# blocker, so every stamp path logs to stderr and exits 0. Listing is held to a
+# stricter contract because its output IS the result — a caller that recorded an
+# empty list as fact would assert the deploy carried nothing, which is worse than
+# a missing stamp.
+# --- usage:end ---
 
 set -u
 
@@ -66,9 +91,17 @@ set -u
 # script may be too old to know (`--fail`, say) can grep `--help` for it rather
 # than discovering the gap as an "Unknown argument" exit 2 mid-pipeline. Keep
 # every supported flag named in the header block for that to keep working.
+#
+# The block is delimited by sentinel comments rather than an absolute line range.
+# It used to be `sed -n '25,58p'`, whose bounds sat exactly on the first and last
+# lines with no slack: documenting a new flag pushed the tail off the end (or,
+# for a line added above, started the help mid-sentence) and silently truncated
+# --help. That is precisely the surface a CI caller probes for flag support, so
+# the failure mode was a caller not finding a flag we do ship and downgrading.
 # ---------------------------------------------------------------------------
 print_usage() {
-    sed -n '25,58p' "$0" | sed -e 's/^# \{0,1\}//' -e 's/^#$//'
+    sed -n '/^# --- usage:begin ---$/,/^# --- usage:end ---$/p' "$0" \
+        | sed -e '1d;$d' -e 's/^# \{0,1\}//' -e 's/^#$//'
 }
 
 # ---------------------------------------------------------------------------
@@ -152,6 +185,7 @@ EXPLICIT_KEY=""
 BRANCH=""
 RANGE=""
 NOTE=""
+LIST_CHANGES=0
 ENV_FILE_EXPLICIT="${DEFPROD_ENV_FILE:-}"
 
 while [[ $# -gt 0 ]]; do
@@ -163,6 +197,7 @@ while [[ $# -gt 0 ]]; do
         --key) EXPLICIT_KEY="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         --range) RANGE="$2"; shift 2 ;;
+        --list-changes) LIST_CHANGES=1; shift ;;
         --note) NOTE="$2"; shift 2 ;;
         --product-id) export DEFPROD_PRODUCT_ID="$2"; shift 2 ;;
         --api-url) export DEFPROD_API_URL="$2"; shift 2 ;;
@@ -174,9 +209,22 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --list-changes stamps nothing, so every stamping argument is meaningless with
+# it. Reject the combination rather than silently ignoring it: a caller that
+# believed it was stamping would otherwise get a listing and no stamp, and find
+# out only when the change record turned out to have no stage times.
+if [[ "$LIST_CHANGES" -eq 1 ]]; then
+    if [[ "$ACTION" != "finishChangeStage" || -n "$STAGE" || -n "$NOTE" ]]; then
+        echo "defprod-stamp: --list-changes cannot be combined with --stage/--start/--cancel/--fail/--note" >&2
+        exit 2
+    fi
+fi
+
 # cancel and fail both act on whatever stage is in progress — the server resolves
-# it — so neither needs (or uses) --stage.
-if [[ -z "$STAGE" && "$ACTION" != "cancelChangeStage" && "$ACTION" != "failChangeStage" ]]; then
+# it — so neither needs (or uses) --stage. --list-changes performs the same
+# correlation but takes no action, so it needs no stage either.
+if [[ -z "$STAGE" && "$ACTION" != "cancelChangeStage" && "$ACTION" != "failChangeStage" \
+      && "$LIST_CHANGES" -eq 0 ]]; then
     echo "defprod-stamp: --stage is required (merge|push|build|package|staging|ship)" >&2
     exit 2
 fi
@@ -195,6 +243,12 @@ PRODUCT_ID="${DEFPROD_PRODUCT_ID:-}"
 # trailers and slug-prefixed (`chg/<slug>/CHG-NN`) branches resolve their own
 # productId, so a multi-product monorepo CI need not set it.
 if [[ -z "$API_URL" || -z "$API_KEY" ]]; then
+    if [[ "$LIST_CHANGES" -eq 1 ]]; then
+        # Not "no changes" — no answer. Emitting an empty list here would let a
+        # caller record a misconfigured run as one that carried nothing.
+        echo "defprod-stamp: missing DEFPROD_API_URL / DEFPROD_API_KEY — cannot list changes" >&2
+        exit 3
+    fi
     echo "defprod-stamp: missing DEFPROD_API_URL / DEFPROD_API_KEY — skipping stamp" >&2
     exit 0
 fi
@@ -225,8 +279,16 @@ resolve_keys() {
     fi
     if [[ -n "$RANGE" ]]; then
         # Batched deploys: every distinct change in the range gets stamped.
-        git log --format=%B "$RANGE" 2>/dev/null | parse_trailers
-        return
+        # Capture git's own status before the pipe — an unreadable range (typo,
+        # unfetched sha, shallow clone) otherwise looks exactly like a range that
+        # genuinely carried no trailers. Returns 4 so the caller can tell them
+        # apart; harmless for stamping, load-bearing for --list-changes.
+        local log_output
+        if ! log_output=$(git log --format=%B "$RANGE" 2>/dev/null); then
+            return 4
+        fi
+        printf '%s\n' "$log_output" | parse_trailers
+        return 0
     fi
     local branch="${BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"
     # New form carries the product slug: chg/<slug>/CHG-NN-... The slug pattern is
@@ -245,10 +307,22 @@ resolve_keys() {
 }
 
 KEYS=$(resolve_keys)
+RESOLVE_RC=$?
+if [[ "$RESOLVE_RC" -ne 0 ]]; then
+    echo "defprod-stamp: could not read git rev range '$RANGE'" >&2
+    [[ "$LIST_CHANGES" -eq 1 ]] && exit 3
+    exit 0
+fi
 if [[ -z "$KEYS" ]]; then
+    # A genuinely empty result. For --list-changes this is a complete answer
+    # (exit 0, no output), not a failure.
     echo "defprod-stamp: no change key found (branch/trailers) — nothing to stamp" >&2
     exit 0
 fi
+
+# Set when any change could not be resolved, so --list-changes can report that
+# its output is partial instead of passing an under-count off as the answer.
+INCOMPLETE=0
 
 # Resolve a product slug to its productId via getProductBySlug. Echoes the
 # productId on success, nothing on failure.
@@ -276,12 +350,24 @@ for TOKEN in $KEYS; do
         RESOLVED=$(resolve_product_id_from_slug "$SLUG")
         if [[ -n "$RESOLVED" ]]; then
             PID="$RESOLVED"
+        elif [[ "$LIST_CHANGES" -eq 1 ]]; then
+            # No fallback when listing. A CHG-NN key is unique only WITHIN a
+            # product, so resolving another product's key against the configured
+            # productId can return a real change that this range never carried —
+            # a confidently wrong id, not a miss. That trade is acceptable for a
+            # stamp (worst case: one stage time on the wrong change, visible in
+            # the change's own event trail) and not for a list, whose output is
+            # the answer. Drop it and mark the answer partial.
+            echo "defprod-stamp: slug '$SLUG' (for $KEY) did not resolve to a product — omitting from the list" >&2
+            INCOMPLETE=1
+            continue
         else
             echo "defprod-stamp: slug '$SLUG' (for $KEY) did not resolve to a product — falling back to configured productId" >&2
         fi
     fi
     if [[ -z "$PID" ]]; then
         echo "defprod-stamp: no productId for $KEY (no slug resolved and DEFPROD_PRODUCT_ID unset) — skipping" >&2
+        INCOMPLETE=1
         continue
     fi
 
@@ -292,6 +378,18 @@ for TOKEN in $KEYS; do
     CHANGE_ID=$(echo "$CHANGE_JSON" | jq -r '.data._id // empty' 2>/dev/null)
     if [[ -z "$CHANGE_ID" ]]; then
         echo "defprod-stamp: change $KEY not found in product $PID — skipping" >&2
+        INCOMPLETE=1
+        continue
+    fi
+
+    # --list-changes stops here: the correlation is the whole product of this
+    # mode. One JSON object per line on stdout — line-oriented so a caller can
+    # stream it, and self-describing so adding a field later does not silently
+    # shift a column out from under anyone. `jq -r .changeId` for bare ids,
+    # `jq -s 'map(.changeId)'` to build the array a deployment run wants.
+    if [[ "$LIST_CHANGES" -eq 1 ]]; then
+        jq -cn --arg key "$KEY" --arg slug "$SLUG" --arg pid "$PID" --arg cid "$CHANGE_ID" \
+            '{key:$key, slug:(if $slug == "" then null else $slug end), productId:$pid, changeId:$cid}'
         continue
     fi
 
@@ -316,8 +414,18 @@ for TOKEN in $KEYS; do
         DETAIL=$(echo "$RESPONSE" | jq -r '.error.detail // .error.title // "unknown"' 2>/dev/null)
         echo "defprod-stamp: $ACTION $STAGE rejected for $KEY: $DETAIL" >&2
     else
-        echo "defprod-stamp: $ACTION $STAGE stamped for $KEY"
+        # stderr, not stdout: stdout is the data channel (--list-changes), and a
+        # progress line on it would corrupt any caller reading the script's
+        # output. Every message this script prints is a diagnostic.
+        echo "defprod-stamp: $ACTION $STAGE stamped for $KEY" >&2
     fi
 done
+
+# Listing is the only mode that reports partial failure. Stamping stays exit-0
+# by design — see the Exit codes note in the header.
+if [[ "$LIST_CHANGES" -eq 1 && "$INCOMPLETE" -eq 1 ]]; then
+    echo "defprod-stamp: --list-changes output is INCOMPLETE — one or more changes did not resolve" >&2
+    exit 3
+fi
 
 exit 0

@@ -98,6 +98,8 @@ Stamps a stage of a DefProd **change record** from a CI/CD hook — so your pipe
 
 The script resolves which change(s) to stamp from your git state, in priority order: `--key` → `--range` (every `Change: <slug>/CHG-NN` trailer in the range) → a `chg/<slug>/CHG-NN-*` (or legacy `chg/CHG-NN-*`) branch name → the `Change: <slug>/CHG-NN` trailer on HEAD. The trailer is **product-scoped by slug**: each key carries its owning product slug, resolved to a productId via `getProductBySlug`, so one push range spanning several products in a monorepo stamps each against the correct product. A slug-prefixed branch (`chg/<slug>/CHG-NN-*`) resolves its own product too; a legacy bare `Change: CHG-NN` trailer, a legacy bare `chg/CHG-NN-*` branch, and `--key` (which carry no slug) fall back to the configured `DEFPROD_PRODUCT_ID`. Use `--start` to mark a stage in progress, `--fail` to record it as failed when the attempt did not succeed (the usual case for a deploy step that aborts), and `--cancel` to revert in-progress stage work to not-started when it was deliberately abandoned. Prefer `--fail` over `--cancel` in a failure trap: cancelling says the work was never started, which makes an aborted run indistinguishable from one that never began. It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
 
+`--list-changes` turns that same correlation into a query — it prints the changes a range carries and stamps nothing. See [Reusing the correlation](#reusing-the-correlation).
+
 #### Usage
 
 ```bash
@@ -115,6 +117,9 @@ defprod-stamp --cancel --note "superseded, picking this up next week"
 
 # Batched deploy: stamp 'ship' for every change in the deployed range
 defprod-stamp --stage ship --range "$BEFORE_SHA..$AFTER_SHA"
+
+# Correlation only — which changes does this range carry? Stamps nothing.
+defprod-stamp --list-changes --range "$BEFORE_SHA..$AFTER_SHA"
 ```
 
 #### Options
@@ -129,6 +134,7 @@ defprod-stamp --stage ship --range "$BEFORE_SHA..$AFTER_SHA"
 | `--key`        | Explicit change key (e.g. `CHG-07`) — skips git correlation           | —              |
 | `--branch`     | Branch name to parse instead of the current branch                    | current branch |
 | `--range`      | Git rev range — stamps every change found in its commit trailers      | —              |
+| `--list-changes` | Print the correlated changes as JSON lines and stamp nothing        | —              |
 | `--note`       | Optional note for the change's event trail                            | —              |
 | `--product-id` | Product ID (or `DEFPROD_PRODUCT_ID`, or `.defprod/defprod.json`)      | —                    |
 | `--api-url`    | API base URL (or `DEFPROD_API_URL`, or `.defprod/defprod.json`)      | —                    |
@@ -171,6 +177,60 @@ correlation that matches how you deploy:
 If you don't pass `--range` and aren't on a `chg/` branch, only the change
 named on the **HEAD commit** is stamped — frequently nothing, when HEAD is a
 merge or chore commit.
+
+#### Reusing the correlation
+
+Working out *which changes a git range carries* is the hard half of this script:
+parsing both trailer forms, resolving each product slug to a productId, and
+looking the change up within the right product. Plenty of CI tasks need that set
+without wanting to stamp anything — recording a deployment run, generating
+release notes, building a changelog, gating on whether a range carries tracked
+work at all.
+
+`--list-changes` exposes it, so you don't write a second implementation that has
+to agree with this one forever. It runs the identical correlation and stops one
+step short of stamping:
+
+```bash
+defprod-stamp --list-changes --range "$BEFORE_SHA..$AFTER_SHA"
+{"key":"CHG-126","slug":"acme-web","productId":"PRODUCT-…","changeId":"CHANGE-…"}
+{"key":"CHG-127","slug":"acme-web","productId":"PRODUCT-…","changeId":"CHANGE-…"}
+```
+
+One JSON object per line. `slug` is `null` for a slug-less correlation (a legacy
+bare trailer, a legacy branch, or `--key`). **stdout carries data only** — every
+diagnostic goes to stderr — so you can read the list without filtering:
+
+```bash
+# just the ids
+ids=$(defprod-stamp --list-changes --range "$RANGE" | jq -r .changeId)
+
+# or the array a deployment-run API wants
+ids_json=$(defprod-stamp --list-changes --range "$RANGE" | jq -s 'map(.changeId)')
+```
+
+It calls no mutating use case, so a **read-scoped** API key is enough.
+
+**Check the exit code.** Unlike stamping, this mode can fail meaningfully, and an
+empty list is a valid answer that looks identical to a broken run:
+
+| Exit | Meaning | What a caller should do |
+|------|---------|-------------------------|
+| `0`  | Correlation completed — the list may be legitimately empty | Use the output |
+| `2`  | Bad arguments | Fix the invocation |
+| `3`  | Correlation **incomplete** — unreadable range, missing config, or a key that didn't resolve | Do **not** treat stdout as the answer |
+
+Stamping still always exits 0, by design: a missed stamp is a visibility bug, not
+a deploy blocker. Listing is held to the stricter contract because its output *is*
+the result — a caller that recorded an empty list as fact would assert the deploy
+carried nothing, which is worse than a missing stamp. For the same reason,
+`--list-changes` will not fall back to the configured `DEFPROD_PRODUCT_ID` when a
+slug fails to resolve: a `CHG-NN` key is unique only *within* a product, so the
+fallback can return a real change from a different product that the range never
+carried. It omits the entry and exits 3 instead.
+
+`--list-changes` cannot be combined with `--stage`, `--start`, `--cancel`,
+`--fail` or `--note` (exit 2) — it stamps nothing, so those are always a mistake.
 
 ## Configuration
 
