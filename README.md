@@ -98,6 +98,45 @@ Stamps a stage of a DefProd **change record** from a CI/CD hook — so your pipe
 
 The script resolves which change(s) to stamp from your git state, in priority order: `--key` → `--range` (every `Change: <slug>/CHG-NN` trailer in the range) → a `chg/<slug>/CHG-NN-*` (or legacy `chg/CHG-NN-*`) branch name → the `Change: <slug>/CHG-NN` trailer on HEAD. The trailer is **product-scoped by slug**: each key carries its owning product slug, resolved to a productId via `getProductBySlug`, so one push range spanning several products in a monorepo stamps each against the correct product. A slug-prefixed branch (`chg/<slug>/CHG-NN-*`) resolves its own product too; a legacy bare `Change: CHG-NN` trailer, a legacy bare `chg/CHG-NN-*` branch, and `--key` (which carry no slug) fall back to the configured `DEFPROD_PRODUCT_ID`. Use `--start` to mark a stage in progress, `--fail` to record it as failed when the attempt did not succeed (the usual case for a deploy step that aborts), and `--cancel` to revert in-progress stage work to not-started when it was deliberately abandoned. Prefer `--fail` over `--cancel` in a failure trap: cancelling says the work was never started, which makes an aborted run indistinguishable from one that never began. It **never fails your pipeline**: missing config or a rejected stamp logs to stderr and exits 0.
 
+#### When a commit does not deliver the whole change
+
+A trailer claims the whole change, which is right when the commit *is* the
+landing. It is not right for a commit that lands an interim artefact — a design
+document, say — because that commit is permanent, a deploy range can legitimately
+re-include it, and it would otherwise be able to carry the change all the way to
+`ship` having delivered none of it.
+
+So the trailer takes an optional **stage ceiling**:
+
+```
+Change: <slug>/CHG-NN:<stage>
+```
+
+meaning *this commit is entitled to advance the change no further than `<stage>`*.
+A stamp beyond every ceiling declared for a change is sent as a no-op: the change
+is neither advanced nor moved back to the ceiling. Omitting the suffix keeps the
+previous meaning — the commit delivers the change in full — so existing history
+and workflows are unaffected.
+
+Ceilings are aggregated across a range, because one deploy commonly carries
+several commits for one change. If **any** of them carries no suffix the change
+is unbounded and stamps normally — a design commit riding alongside the real
+landing never blocks the ship.
+
+The reported commit is also sent with the stamp, so the same commit never
+advances the same stage twice however often a range re-includes it.
+
+**Check for support before writing a suffix.** An older copy of this script
+matches only the trailer prefix, so it silently truncates a suffix and treats the
+commit as delivering the change in full — the dangerous direction of version
+skew. Probe the help text first:
+
+```sh
+npx @defprod/scripts defprod-stamp --help 2>&1 \
+    | grep -q 'supports-trailer-stage-ceiling' \
+    && echo "suffix supported" || echo "omit the suffix"
+```
+
 `--list-changes` turns that same correlation into a query — it prints the changes a range carries and stamps nothing. See [Reusing the correlation](#reusing-the-correlation).
 
 #### Usage
