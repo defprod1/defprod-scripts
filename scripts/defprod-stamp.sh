@@ -14,6 +14,7 @@
 #   1. --key CHG-NN (or <slug>/CHG-NN)     explicit
 #   2. branch matching chg/<slug>/CHG-NN-* (or legacy chg/CHG-NN-*) (current, or --branch)
 #   3. 'Change: <slug>/CHG-NN' trailers    on HEAD, or across --range
+#      'Change: <slug>/CHG-NN:<stage>'    optional stage ceiling on any trailer
 #
 # The commit trailer is product-scoped by slug (a bare CHG-NN key is only unique
 # WITHIN a product). Each resolved key carries its owning product slug; the slug
@@ -28,6 +29,13 @@
 #
 #   --stage             Pipeline stage: merge|push|build|package|staging|ship
 #                       (required for --start and finish; ignored by --cancel/--fail)
+#
+#   Trailer stage ceiling: a commit may declare the furthest stage it delivers as
+#   'Change: <slug>/CHG-NN:<stage>'. A stamp beyond every declared ceiling is sent
+#   as a no-op rather than advancing the change. Tooling that WRITES the suffix must
+#   confirm this support marker is present first, because an older copy of this
+#   script silently truncates the suffix and treats the commit as delivering the
+#   change in full. Support marker: supports-trailer-stage-ceiling
 #   --start             Call startChangeStage (mark the stage in progress)
 #   --cancel            Call cancelChangeStage — cancel the in-progress stage
 #                       work, returning it to not started (ignores --stage)
@@ -256,24 +264,80 @@ fi
 # ---------------------------------------------------------------------------
 # Correlation: resolve the change key(s) for this stamp
 # ---------------------------------------------------------------------------
-# Emit one `slug|key` token per correlated change (slug empty when the carrier
-# has none). Parses both the product-scoped `Change: <slug>/CHG-NN` trailer and
-# the legacy bare `Change: CHG-NN`.
-parse_trailers() {
-    # stdin: commit message bodies. stdout: deduped `slug|key` tokens.
-    grep -oE '^Change:[[:space:]]+([a-z0-9][a-z0-9-]*/)?CHG-[0-9]+' 2>/dev/null \
+# Emit one `slug|key|ceilings|sha` token per correlated change (fields empty when
+# the carrier has none). Parses the product-scoped `Change: <slug>/CHG-NN`
+# trailer, the legacy bare `Change: CHG-NN`, and the optional stage suffix
+# `Change: <slug>/CHG-NN:<stage>`.
+#
+# The suffix declares the furthest stage that COMMIT is entitled to advance its
+# change to. A commit without one delivers the change in full, which is the
+# default and the majority case, so the format stays backward compatible.
+#
+# Note the regex previously ended at the key, and `grep -oE` matches a prefix: a
+# suffixed trailer read by an older copy of this script silently truncates to
+# `<slug>/CHG-NN` and is treated as delivering the change in full. That is the
+# dangerous direction of version skew, which is why the tooling that WRITES the
+# suffix must check this script supports it first.
+
+# Extract the raw trailers from one commit message on stdin, as `slug|key|ceiling`.
+parse_trailers_raw() {
+    grep -oE '^Change:[[:space:]]+([a-z0-9][a-z0-9-]*/)?CHG-[0-9]+(:[A-Za-z][A-Za-z0-9]*)?' 2>/dev/null \
         | sed -E 's/^Change:[[:space:]]+//' \
-        | awk -F/ '{ if (NF == 2) print $1 "|" $2; else print "|" $1 }' \
+        | awk -F'[/:]' '{
+              if (NF == 3)      { print $1 "|" $2 "|" $3 }
+              else if (NF == 2) { if ($0 ~ /\//) print $1 "|" $2 "|"; else print "|" $1 "|" $2 }
+              else              { print "|" $1 "|" }
+          }' \
         | sort -u
+}
+
+# Aggregate the trailers across a set of commits, newest first on stdin (one sha
+# per line), into one `slug|key|ceilings|sha` token per change.
+#
+# Aggregation matters because a deploy range routinely carries SEVERAL commits for
+# one change — a design commit and the landing commit often ship in the same
+# deploy — and the landing is what entitles the ship. So:
+#
+#   * if ANY commit for the change carried no suffix, the change is unbounded and
+#     the ceilings field is emitted empty;
+#   * otherwise every declared ceiling is passed through, comma separated, and the
+#     server decides using the one stage order there is. Ordering deliberately
+#     does NOT live in this script: a second copy of it here would drift from the
+#     first, which has happened before in this pipeline.
+#
+# `sha` is the NEWEST commit carrying the change in the range — the landing, in
+# the usual case — and is what makes the stamp idempotent: the server refuses a
+# second advance of the same stage from the same commit, however many times a
+# range re-includes it.
+aggregate_trailers() {
+    awk -F'|' '
+        {
+            sha = $4; slug = $1; key = $2; ceiling = $3;
+            id = slug "|" key;
+            if ( !(id in firstsha) ) { firstsha[id] = sha; order[++n] = id; }
+            if ( ceiling == "" ) { unbounded[id] = 1; }
+            else if ( !(id in unbounded) ) {
+                if ( ceilings[id] == "" ) ceilings[id] = ceiling;
+                else if ( index("," ceilings[id] ",", "," ceiling ",") == 0 ) ceilings[id] = ceilings[id] "," ceiling;
+            }
+        }
+        END {
+            for ( i = 1; i <= n; i++ ) {
+                id = order[i];
+                c = (id in unbounded) ? "" : ceilings[id];
+                print id "|" c "|" firstsha[id];
+            }
+        }
+    '
 }
 
 resolve_keys() {
     if [[ -n "$EXPLICIT_KEY" ]]; then
         # Accept either a bare key or a <slug>/CHG-NN form.
         if [[ "$EXPLICIT_KEY" == */* ]]; then
-            echo "${EXPLICIT_KEY%%/*}|${EXPLICIT_KEY##*/}"
+            echo "${EXPLICIT_KEY%%/*}|${EXPLICIT_KEY##*/}||"
         else
-            echo "|$EXPLICIT_KEY"
+            echo "|$EXPLICIT_KEY||"
         fi
         return
     fi
@@ -283,11 +347,19 @@ resolve_keys() {
         # unfetched sha, shallow clone) otherwise looks exactly like a range that
         # genuinely carried no trailers. Returns 4 so the caller can tell them
         # apart; harmless for stamping, load-bearing for --list-changes.
-        local log_output
-        if ! log_output=$(git log --format=%B "$RANGE" 2>/dev/null); then
+        local shas
+        if ! shas=$(git log --format=%H "$RANGE" 2>/dev/null); then
             return 4
         fi
-        printf '%s\n' "$log_output" | parse_trailers
+        # Per-commit rather than one concatenated blob: the sha has to stay
+        # attached to the trailer it came from, which a single `git log --format=%B`
+        # over the whole range throws away. Newest first, as git emits them.
+        local sha body
+        while IFS= read -r sha; do
+            [[ -n "$sha" ]] || continue
+            body=$(git log -1 --format=%B "$sha" 2>/dev/null)
+            printf '%s\n' "$body" | parse_trailers_raw | sed -e "s|\$|\|${sha}|"
+        done <<< "$shas" | aggregate_trailers
         return 0
     fi
     local branch="${BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"
@@ -295,15 +367,21 @@ resolve_keys() {
     # lowercase/url-safe, so it never matches an uppercase `CHG-` — a legacy
     # chg/CHG-NN-... branch correctly falls through to the slug-less case below.
     if [[ "$branch" =~ ^chg/([a-z0-9][a-z0-9-]*)/(CHG-[0-9]+) ]]; then
-        echo "${BASH_REMATCH[1]}|${BASH_REMATCH[2]}"
+        echo "${BASH_REMATCH[1]}|${BASH_REMATCH[2]}||"
         return
     fi
     if [[ "$branch" =~ ^chg/(CHG-[0-9]+) ]]; then
         # Legacy branch names carry no slug — fall back to the configured productId.
-        echo "|${BASH_REMATCH[1]}"
+        echo "|${BASH_REMATCH[1]}||"
         return
     fi
-    git log -1 --format=%B 2>/dev/null | parse_trailers
+    # HEAD's own trailer, carrying HEAD's sha so this path is de-duplicated too.
+    local head_sha
+    head_sha=$(git rev-parse HEAD 2>/dev/null || printf '')
+    git log -1 --format=%B 2>/dev/null \
+        | parse_trailers_raw \
+        | sed -e "s|\$|\|${head_sha}|" \
+        | aggregate_trailers
 }
 
 KEYS=$(resolve_keys)
@@ -340,8 +418,7 @@ resolve_product_id_from_slug() {
 # Stamp each change (never fail the pipeline)
 # ---------------------------------------------------------------------------
 for TOKEN in $KEYS; do
-    SLUG="${TOKEN%%|*}"
-    KEY="${TOKEN#*|}"
+    IFS='|' read -r SLUG KEY CEILINGS COMMIT_SHA <<< "$TOKEN"
 
     # Product resolution: a slug in the trailer names its own product; otherwise
     # fall back to the configured DEFPROD_PRODUCT_ID.
@@ -403,7 +480,19 @@ for TOKEN in $KEYS; do
     if [[ "$ACTION" == "cancelChangeStage" || "$ACTION" == "failChangeStage" ]]; then
         INPUT="{\"changeId\":\"$CHANGE_ID\"$NOTE_FIELD}"
     else
-        INPUT="{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD}"
+        # Commit provenance rides only on start/finish, the two actions that move
+        # the change. An empty CEILINGS field means at least one correlated commit
+        # delivers the change in full, so the field is omitted entirely rather than
+        # sent empty — an empty array would read as "entitled to nothing".
+        PROVENANCE_FIELDS=""
+        if [[ -n "$CEILINGS" ]]; then
+            CEILINGS_JSON=$(printf '%s' "$CEILINGS" | jq -Rc 'split(",")' 2>/dev/null)
+            [[ -n "$CEILINGS_JSON" ]] && PROVENANCE_FIELDS=",\"stageCeilings\":$CEILINGS_JSON"
+        fi
+        if [[ -n "$COMMIT_SHA" ]]; then
+            PROVENANCE_FIELDS="$PROVENANCE_FIELDS,\"commitSha\":$(jq -Rn --arg v "$COMMIT_SHA" '$v')"
+        fi
+        INPUT="{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD$PROVENANCE_FIELDS}"
     fi
     RESPONSE=$(curl -sk -X POST "$API_URL" \
         -H "Content-Type: application/json" \
