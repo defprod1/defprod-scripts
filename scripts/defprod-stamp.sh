@@ -492,6 +492,18 @@ for TOKEN in $KEYS; do
         if [[ -n "$COMMIT_SHA" ]]; then
             PROVENANCE_FIELDS="$PROVENANCE_FIELDS,\"commitSha\":$(jq -Rn --arg v "$COMMIT_SHA" '$v')"
         fi
+        # driver — always `cicd` from here, because that is what this script IS:
+        # it derives the change and the stage from a git range on a build box, so
+        # every report it makes is automated pipeline reporting by construction.
+        #
+        # Not optional, and not inferable server-side. The backend's forward-only
+        # rule for pipeline reporting turns on this exact value, so while the field
+        # went unsent the rule was unreachable and a re-swept commit could still
+        # rewind a change mid-review — the guard was shipped inert. The backend
+        # cannot fill it in either: an agent driving under a person's API key
+        # authenticates as that person, so the credential cannot tell automated
+        # reporting from a human action. It has to be attested by the caller.
+        PROVENANCE_FIELDS="$PROVENANCE_FIELDS,\"driver\":\"cicd\""
         INPUT="{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD$PROVENANCE_FIELDS}"
     fi
     RESPONSE=$(curl -sk -X POST "$API_URL" \
