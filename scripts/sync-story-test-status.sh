@@ -49,7 +49,7 @@ set -euo pipefail
 
 # ---- Helpers ----
 
-VERSION="dev" # baked by prepublish
+VERSION="dev" # baked at pack time
 
 load_env_file() {
     local file="$1"

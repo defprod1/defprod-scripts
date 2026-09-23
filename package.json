@@ -30,7 +30,8 @@
     "README.md"
   ],
   "scripts": {
-    "prepublishOnly": "sed -i \"s/^VERSION=\\\"[^\\\"]*\\\" # baked by prepublish$/VERSION=\\\"$(node -p \"require('./package.json').version\")\\\" # baked by prepublish/\" scripts/sync-story-test-status.sh"
+    "prepack": "v=$(node -p \"require('./package.json').version\") && sed -i \"s/^VERSION=\\\"[^\\\"]*\\\" # baked at pack time$/VERSION=\\\"$v\\\" # baked at pack time/\" scripts/sync-story-test-status.sh && grep -q \"^VERSION=\\\"$v\\\" # baked at pack time$\" scripts/sync-story-test-status.sh || { echo \"prepack: could not bake VERSION into scripts/sync-story-test-status.sh\" >&2; exit 1; }",
+    "postpack": "sed -i \"s/^VERSION=\\\"[^\\\"]*\\\" # baked at pack time$/VERSION=\\\"dev\\\" # baked at pack time/\" scripts/sync-story-test-status.sh"
   },
   "engines": {
     "node": ">=18"
