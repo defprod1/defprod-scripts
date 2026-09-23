@@ -414,6 +414,15 @@ resolve_product_id_from_slug() {
     echo "$json" | jq -r '.data._id // empty' 2>/dev/null
 }
 
+# POST one RPC and echo the raw response body.
+post_rpc() {
+    local name="$1" input="$2"
+    curl -sk -X POST "$API_URL" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $API_KEY" \
+        -d "{\"name\":\"$name\",\"input\":$input}" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Stamp each change (never fail the pipeline)
 # ---------------------------------------------------------------------------
@@ -471,6 +480,7 @@ for TOKEN in $KEYS; do
     fi
 
     NOTE_FIELD=""
+    LEGACY_INPUT=""
     if [[ -n "$NOTE" ]]; then
         NOTE_FIELD=",\"note\":$(jq -Rn --arg n "$NOTE" '$n')"
     fi
@@ -492,7 +502,7 @@ for TOKEN in $KEYS; do
         if [[ -n "$COMMIT_SHA" ]]; then
             PROVENANCE_FIELDS="$PROVENANCE_FIELDS,\"commitSha\":$(jq -Rn --arg v "$COMMIT_SHA" '$v')"
         fi
-        # driver — always `cicd` from here, because that is what this script IS:
+        # oversight — always `cicd` from here, because that is what this script IS:
         # it derives the change and the stage from a git range on a build box, so
         # every report it makes is automated pipeline reporting by construction.
         #
@@ -503,14 +513,20 @@ for TOKEN in $KEYS; do
         # cannot fill it in either: an agent driving under a person's API key
         # authenticates as that person, so the credential cannot tell automated
         # reporting from a human action. It has to be attested by the caller.
-        PROVENANCE_FIELDS="$PROVENANCE_FIELDS,\"driver\":\"cicd\""
-        INPUT="{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD$PROVENANCE_FIELDS}"
+        #
+        # The field was named `driver` before the server renamed it. A server that
+        # predates the rename refuses `oversight` as an undeclared key, so that
+        # refusal is retried once with the same value under the old name below.
+        INPUT="{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD$PROVENANCE_FIELDS,\"oversight\":\"cicd\"}"
+        LEGACY_INPUT="{\"changeId\":\"$CHANGE_ID\",\"stage\":\"$STAGE\"$NOTE_FIELD$PROVENANCE_FIELDS,\"driver\":\"cicd\"}"
     fi
-    RESPONSE=$(curl -sk -X POST "$API_URL" \
-        -H "Content-Type: application/json" \
-        -H "x-api-key: $API_KEY" \
-        -d "{\"name\":\"$ACTION\",\"input\":$INPUT}" 2>/dev/null)
+    RESPONSE=$(post_rpc "$ACTION" "$INPUT")
     ERROR=$(echo "$RESPONSE" | jq -r '.meta.error // false' 2>/dev/null)
+    if [[ "$ERROR" == "true" && -n "$LEGACY_INPUT" ]] \
+        && echo "$RESPONSE" | jq -r '.error.detail // .error.title // ""' 2>/dev/null | grep -qi 'oversight'; then
+        RESPONSE=$(post_rpc "$ACTION" "$LEGACY_INPUT")
+        ERROR=$(echo "$RESPONSE" | jq -r '.meta.error // false' 2>/dev/null)
+    fi
     if [[ "$ERROR" == "true" ]]; then
         DETAIL=$(echo "$RESPONSE" | jq -r '.error.detail // .error.title // "unknown"' 2>/dev/null)
         echo "defprod-stamp: $ACTION $STAGE rejected for $KEY: $DETAIL" >&2
