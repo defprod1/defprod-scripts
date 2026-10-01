@@ -393,7 +393,7 @@ echo "[]" > "$RESULTS_DIR/covered-paths.json"
 #   - Filename-keyed (system): a story is covered when a file named
 #     <STORY-KEY>.test.ts exists anywhere under <dir>. Used for `system`-surface
 #     stories (event handlers, scheduled jobs, reactive fan-out) whose unit tests
-#     live under apps/defprod-back/src/tests/modules/<code-module>/ — the
+#     live under apps/defprod-back/src/unit/modules/<code-module>/ — the
 #     directory is the CODE MODULE, not the product area, so the product link is
 #     carried by the filename. The area is the story-key prefix.
 walk_suite_coverage() {
@@ -931,6 +931,7 @@ echo "$STORIES_JSON" | jq \
             ),
             testExemptReason: ($story.testExemptReason // null),
             storyStatus: ($story.status // null),
+            surface: ($story.surface // null),
             result: null,
             totalTests: null,
             passedTests: null,
@@ -993,13 +994,24 @@ if [[ "$DRY_RUN" == "true" ]]; then
     exit 0
 fi
 
+# `storyStatus` and `surface` are for LOCAL tooling, not the server. They are
+# not part of the syncStoryTestStatus input, and nothing server-side wants them:
+# the dashboard already joins each record to its user story. They exist in the
+# payload purely so tools that read the DRY RUN above (coverage checkers, sweep
+# runners) can tell a backlog story from a built one, and a UI story from an
+# API/MCP/CLI/system one, without a second round-trip — which is why they are
+# stripped HERE rather than never added. The server rejects undeclared keys
+# inside a status record, so posting them would fail the whole sync.
+POST_PAYLOAD_FILE="$RESULTS_DIR/payload.post.json"
+jq 'del(.input.statuses[] | .storyStatus, .surface)' "$PAYLOAD_FILE" > "$POST_PAYLOAD_FILE"
+
 echo ""
 echo "Posting results to DefProd..."
 
 RESPONSE=$(curl -sk -X POST "$API_URL" \
     -H "Content-Type: application/json" \
     -H "x-api-key: $API_KEY" \
-    -d "@$PAYLOAD_FILE" 2>/dev/null)
+    -d "@$POST_PAYLOAD_FILE" 2>/dev/null)
 
 UPSERTED=$(echo "$RESPONSE" | jq -r '.data.upsertedCount // "?"')
 DELETED=$(echo "$RESPONSE" | jq -r '.data.deletedCount // "?"')

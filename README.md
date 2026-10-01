@@ -67,6 +67,12 @@ defprod-sync-tests --area-key CORE
 | `--skip-run`          | Check coverage only, do not run tests                          | `false`                   |
 | `--init`              | Interactive setup — writes `.defprod/` config                  | —                         |
 
+The `--dry-run` payload is also handy input for your own tooling: each entry in
+`input.statuses` carries the story's lifecycle `storyStatus` and its declared
+`surface` (`ui`, `api`, `mcp`, `cli`, `system`, `other`, or `null` when the story
+declares none). Both fields are local-only. They are removed before a real sync
+posts the payload.
+
 #### CI example (GitHub Actions)
 
 ```yaml
