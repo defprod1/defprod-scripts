@@ -45,6 +45,12 @@
 #                       recorded as failed rather than reverted to not started, so
 #                       an aborted run is not mistaken for one that never began.
 #                       Pair it with --note carrying the reason (stage, exit code).
+#                       --cancel and --fail skip a change that has no stage work
+#                       in progress (it reports "skipped: no in-progress stage"
+#                       and sends nothing), because the server would only reject
+#                       the call. A --range re-failed by a second failed build is
+#                       the usual source. Support marker:
+#                       skips-not-in-progress-fail-cancel
 #   --key               Explicit change key (e.g. CHG-07) — skips git correlation
 #   --branch            Branch name to parse instead of the current branch
 #   --range             Git rev range (e.g. abc123..def456) — stamps EVERY distinct
@@ -488,6 +494,23 @@ for TOKEN in $KEYS; do
     # progress — they take no `stage` (the server resolves it); start/finish
     # carry the explicit stage.
     if [[ "$ACTION" == "cancelChangeStage" || "$ACTION" == "failChangeStage" ]]; then
+        # Both act only on in-progress work, and the server rejects them for a
+        # change with none. Over a --range that is routine, not exceptional: a
+        # build that fails twice leaves the range baseline where it was, so the
+        # second failure re-reports every change the first one already failed,
+        # and each rejection lands in the server's error log. The getChange
+        # above already says whether there is anything to act on, so skip the
+        # change rather than send a call that can only be refused.
+        #
+        # Absent means send. A server whose getChange carries no stageState
+        # must keep getting the call exactly as before: skipping on a missing
+        # field would stop this script failing anything at all against it.
+        STAGE_STATE=$(echo "$CHANGE_JSON" | jq -r '.data.stageState // empty' 2>/dev/null)
+        if [[ -n "$STAGE_STATE" && "$STAGE_STATE" != "inProgress" ]]; then
+            CURRENT_STAGE=$(echo "$CHANGE_JSON" | jq -r '.data.stage // "unknown"' 2>/dev/null)
+            echo "defprod-stamp: $ACTION skipped for $KEY: no in-progress stage ($CURRENT_STAGE is $STAGE_STATE)" >&2
+            continue
+        fi
         INPUT="{\"changeId\":\"$CHANGE_ID\"$NOTE_FIELD}"
     else
         # Commit provenance rides only on start/finish, the two actions that move
