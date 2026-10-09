@@ -36,6 +36,13 @@
 #   confirm this support marker is present first, because an older copy of this
 #   script silently truncates the suffix and treats the commit as delivering the
 #   change in full. Support marker: supports-trailer-stage-ceiling
+#
+#   Shipped changes: a start or finish for a change that has already shipped is
+#   not sent, because a shipped record is frozen and the server would only reject
+#   it. The script prints a WARNING naming the commit whose Change: trailer points
+#   at the shipped change instead: either that trailer reuses a shipped change's
+#   key, or the range baseline is behind a commit that already shipped. Support
+#   marker: skips-shipped-start-finish
 #   --start             Call startChangeStage (mark the stage in progress)
 #   --cancel            Call cancelChangeStage — cancel the in-progress stage
 #                       work, returning it to not started (ignores --stage)
@@ -513,6 +520,29 @@ for TOKEN in $KEYS; do
         fi
         INPUT="{\"changeId\":\"$CHANGE_ID\"$NOTE_FIELD}"
     else
+        # A shipped change is frozen, and the server refuses every start/finish for
+        # it. A --range that still carries a commit naming one is the usual source,
+        # and each build (and each retry) then sends a pair of calls that can only be
+        # refused. So don't send them, and say loudly which commit named the change:
+        # either its trailer reuses a shipped change's key, or the range baseline is
+        # behind a commit that already shipped. Silence would hide both.
+        #
+        # Shipped means stage ship, completed: the server's own isChangeShipped.
+        # Absent means send, as the skip above does: a server whose getChange
+        # carries no position must keep getting the call exactly as before.
+        CHANGE_POSITION=$(echo "$CHANGE_JSON" | jq -r '"\(.data.stage // "")/\(.data.stageState // "")"' 2>/dev/null)
+        if [[ "$CHANGE_POSITION" == "ship/completed" ]]; then
+            DISPLAY_KEY="$KEY"
+            [[ -n "$SLUG" ]] && DISPLAY_KEY="$SLUG/$KEY"
+            WHERE=""
+            if [[ -n "$COMMIT_SHA" && -n "$RANGE" ]]; then
+                WHERE=" Commit ${COMMIT_SHA:0:12} in this range carries its Change: trailer — either that trailer reuses a shipped change's key, or the range baseline is behind a commit that already shipped."
+            elif [[ -n "$COMMIT_SHA" ]]; then
+                WHERE=" Commit ${COMMIT_SHA:0:12} carries its Change: trailer, which reuses a shipped change's key."
+            fi
+            echo "defprod-stamp: WARNING: $ACTION $STAGE not sent for $DISPLAY_KEY: the change is already shipped.$WHERE" >&2
+            continue
+        fi
         # Commit provenance rides only on start/finish, the two actions that move
         # the change. An empty CEILINGS field means at least one correlated commit
         # delivers the change in full, so the field is omitted entirely rather than
