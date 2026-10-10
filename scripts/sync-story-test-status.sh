@@ -29,16 +29,25 @@
 #                       match a --test-suites entry; several comma-separated paths
 #                       are unioned (Playwright split across passes). Coverage is
 #                       still walked from <dir>, so a covered story missing from the
-#                       report keeps its previous result instead of being nulled.
+#                       report is posted as not run.
 #                       Also readable from DEFPROD_ADOPT_REPORTS (';'-separated).
+#   --adopt-only        Never run a suite: a suite with no --adopt-report is skipped
+#                       and its covered stories are posted as not run. Use this when
+#                       another runner owns test execution, so a missing report can
+#                       never trigger a run under a different configuration.
+#                       Also readable from DEFPROD_ADOPT_ONLY=true.
 #   --area-key          Narrow scope to a single product area (e.g. CORE)
 #   --env-file          Explicit env file to load (else .defprod/defprod.env, legacy .defprod.env)
 #   --dry-run           Print payload without posting
-#   --skip-run          Coverage only: refresh coverage + test-exemptions WITHOUT
-#                       running tests. Existing pass/fail results are preserved
-#                       (fetched and carried forward), never nulled.
+#   --skip-run          Coverage only: walk coverage + test-exemptions WITHOUT
+#                       running tests. Requires --dry-run: a run that measured no
+#                       results has none to post.
 #   --init              Interactive setup — creates .defprod/ config
 #   --version, -v       Print version and exit
+#
+# Every posted result reflects THIS run only. A covered story the run produced no
+# result for (quarantined, filtered out, or absent from an adopted report) is
+# posted as not run — nothing is carried over from an earlier sync.
 #
 # Config resolution (first writer wins): CLI flags > exported env vars >
 # --env-file/DEFPROD_ENV_FILE > .defprod/defprod.env (git-ignored secrets) >
@@ -230,6 +239,7 @@ PW_CONFIG="${DEFPROD_PLAYWRIGHT_CONFIG:-./playwright.config.ts}"
 PW_PROJECTS="${DEFPROD_PLAYWRIGHT_PROJECTS-chromium}"
 TEST_SUITES_RAW="${DEFPROD_TEST_SUITES:-}"
 ADOPT_REPORTS_RAW="${DEFPROD_ADOPT_REPORTS:-}"
+ADOPT_ONLY="${DEFPROD_ADOPT_ONLY:-false}"
 AREA_KEY="${DEFPROD_AREA_KEY:-}"
 DRY_RUN=false
 SKIP_RUN=false
@@ -244,6 +254,7 @@ while [[ $# -gt 0 ]]; do
         --project)      PW_PROJECTS="$2"; shift 2 ;;
         --test-suites)  TEST_SUITES_RAW="$2"; shift 2 ;;
         --adopt-report) ADOPT_REPORTS_RAW="${ADOPT_REPORTS_RAW:+${ADOPT_REPORTS_RAW};}$2"; shift 2 ;;
+        --adopt-only)   ADOPT_ONLY=true; shift ;;
         --area-key)     AREA_KEY="$2"; shift 2 ;;
         --env-file)     shift 2 ;;  # already handled in early parse
         --dry-run)      DRY_RUN=true; shift ;;
@@ -261,6 +272,15 @@ done
 if [[ -z "$PRODUCT_ID" ]]; then echo "Error: --product-id or DEFPROD_PRODUCT_ID required" >&2; exit 1; fi
 if [[ -z "$API_URL" ]]; then echo "Error: --api-url or DEFPROD_API_URL required" >&2; exit 1; fi
 if [[ -z "$API_KEY" ]]; then echo "Error: --api-key or DEFPROD_API_KEY required" >&2; exit 1; fi
+if [[ "$ADOPT_ONLY" != "true" && "$ADOPT_ONLY" != "false" ]]; then
+    echo "Error: DEFPROD_ADOPT_ONLY must be 'true' or 'false', got '$ADOPT_ONLY'" >&2; exit 1
+fi
+# Posting is a full statement of this run's results, so a run that executes no
+# tests has nothing to post: it would report every covered story as not run.
+if [[ "$SKIP_RUN" == "true" && "$DRY_RUN" != "true" ]]; then
+    echo "Error: --skip-run measures no results, so it cannot post. Add --dry-run to inspect coverage." >&2
+    exit 1
+fi
 
 # ---- Resolve suites list ----
 
@@ -335,28 +355,6 @@ STORIES_JSON=$(curl -sk -X POST "$API_URL" \
 if [[ -n "$AREA_KEY" ]]; then
     AREAS_JSON=$(echo "$AREAS_JSON" | jq --arg key "$AREA_KEY" '{ data: [.data[] | select(.key == $key)] }')
     STORIES_JSON=$(echo "$STORIES_JSON" | jq --arg key "$AREA_KEY" '{ data: [.data[] | select(.key | startswith($key + "-"))] }')
-fi
-
-# A sync must NOT clobber pass/fail it did not measure. Fetch the product's
-# existing per-story statuses so Step 4 can carry the result fields forward in
-# the two cases where this run has nothing fresh to say about a story:
-#
-#   1. --skip-run — no suite ran at all, so NOTHING was measured.
-#   2. A COVERED story absent from the results. Its spec exists, so silence is
-#      not evidence of anything: the spec may have been quarantined, filtered
-#      out by a grep, or excluded from an adopted report. Nulling it would make
-#      a full run look like a regression to "never tested" every single night.
-#
-# An UNCOVERED story is different: its spec is gone, so an old result is stale
-# by definition and is allowed to fall away.
-EXISTING_STATUSES_JSON=$(curl -sk -X POST "$API_URL" \
-    -H "Content-Type: application/json" \
-    -H "x-api-key: $API_KEY" \
-    -d "{\"name\":\"getStoryTestStatusForProduct\",\"input\":{\"productId\":\"$PRODUCT_ID\"}}" 2>/dev/null)
-# Tolerate any non-array/error shape — fall back to empty so a fetch failure
-# never turns into wiping results.
-if ! echo "$EXISTING_STATUSES_JSON" | jq -e '.data | type == "array"' >/dev/null 2>&1; then
-    EXISTING_STATUSES_JSON='{"data":[]}'
 fi
 
 AREA_COUNT=$(echo "$AREAS_JSON" | jq '.data | length')
@@ -829,6 +827,12 @@ for suite_spec in "${TEST_SUITES[@]}"; do
     if [[ -n "$suite_adopted" ]]; then
         suite_results_raw="$suite_adopted"
         echo "  Adopting report: $suite_adopted"
+    elif [[ "$ADOPT_ONLY" == "true" ]]; then
+        # Another runner owns execution. Running the suite here would use a
+        # different configuration and environment from the one it intended, so
+        # the suite's covered stories are posted as not run instead.
+        echo "  No adopted report and --adopt-only set — not running; its covered stories post as not run"
+        continue
     fi
 
     case "$suite_harness" in
@@ -896,28 +900,21 @@ done
 
 # Start from the API story list, then enrich each story with coverage + result.
 #
-# Result fields come from a freshly-run suite ($r) where this run measured one.
-# Where it did not, the server's EXISTING result ($e) is carried forward rather
-# than nulled — see the fetch above for why. That covers --skip-run (nothing ran)
-# and any COVERED story missing from the results (quarantined, grep-filtered, or
-# absent from an adopted report).
-#
-# An UNCOVERED story is never carried forward: no spec means no current claim,
-# so a stale result is allowed to fall away. A story with neither stays null.
+# Result fields come only from what THIS run measured ($r). A story the run has
+# no result for — quarantined, filtered out, absent from an adopted report, or a
+# suite --adopt-only skipped — is posted with null results ("not run"). Nothing
+# is read back from the server: the payload is a function of this run alone, so
+# re-running the same inputs always posts the same statuses, and one bad run can
+# never leave a result behind that later runs keep re-posting.
 STATUSES_FILE="$RESULTS_DIR/statuses.json"
-echo "$EXISTING_STATUSES_JSON" | jq '.data // []' > "$RESULTS_DIR/existing-statuses.json"
-SKIP_RUN_JSON=$([[ "$SKIP_RUN" == "true" ]] && echo true || echo false)
 echo "$STORIES_JSON" | jq \
     --slurpfile covered "$RESULTS_DIR/covered-paths.json" \
-    --slurpfile results "$RESULTS_DIR/per-story-results.json" \
-    --slurpfile existing "$RESULTS_DIR/existing-statuses.json" \
-    --argjson skipRun "$SKIP_RUN_JSON" '
+    --slurpfile results "$RESULTS_DIR/per-story-results.json" '
     [.data[] |
         . as $story |
         ($story.key | split("-")[0]) as $areaKey |
         ($areaKey + "/" + $story.key) as $path |
         ([$results[0][] | select(.areaKey == $areaKey and .storyKey == $story.key)] | first) as $r |
-        ([$existing[0][] | select(.userStoryId == $story._id)] | first) as $e |
         ({
             userStoryId: $story._id,
             storyKey: $story.key,
@@ -950,17 +947,6 @@ echo "$STORIES_JSON" | jq \
                 skippedTests: $r.skippedTests,
                 failedTestTitles: $r.failedTestTitles,
                 lastRunAt: $r.lastRunAt
-            }
-        elif ( $e != null and ($skipRun or .coverage == "covered") ) then
-            . + {
-                result: $e.result,
-                totalTests: $e.totalTests,
-                passedTests: $e.passedTests,
-                failedTests: $e.failedTests,
-                flakyTests: $e.flakyTests,
-                skippedTests: $e.skippedTests,
-                failedTestTitles: ($e.failedTestTitles // []),
-                lastRunAt: $e.lastRunAt
             }
         else . end
     ]' > "$STATUSES_FILE"

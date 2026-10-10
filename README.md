@@ -43,8 +43,8 @@ Both `defprod-sync-tests` and `defprod-stamp` read this `.defprod/` layout autom
 # Full sync — detect coverage, run tests, post results
 defprod-sync-tests
 
-# Detect coverage only (no test execution)
-defprod-sync-tests --skip-run
+# Inspect coverage only (no test execution, never posts)
+defprod-sync-tests --skip-run --dry-run
 
 # Preview the payload without posting
 defprod-sync-tests --dry-run
@@ -64,7 +64,8 @@ defprod-sync-tests --area-key CORE
 | `--playwright-config` | Playwright config path (or `DEFPROD_PLAYWRIGHT_CONFIG`)        | `./playwright.config.ts`  |
 | `--area-key`          | Narrow scope to a single product area (e.g. `CORE`)            | —                         |
 | `--dry-run`           | Print payload without posting                                  | `false`                   |
-| `--skip-run`          | Check coverage only, do not run tests                          | `false`                   |
+| `--skip-run`          | Check coverage only, do not run tests. Requires `--dry-run`    | `false`                   |
+| `--adopt-only`        | Never run a suite; a suite without `--adopt-report` posts as not run (or `DEFPROD_ADOPT_ONLY=true`) | `false` |
 | `--init`              | Interactive setup — writes `.defprod/` config                  | —                         |
 
 The `--dry-run` payload is also handy input for your own tooling: each entry in
@@ -360,9 +361,13 @@ npx @defprod/scripts defprod-sync-tests \
   example a parallel pass plus a single-worker pass for tests that must not run
   concurrently). Adopting only one would report the rest as unrun.
 - Coverage is still walked from `<dir>`, so a story whose spec exists but is absent
-  from the report — quarantined, or filtered out by a grep — **keeps its previous
-  result** rather than being reset. A story whose spec is gone is reset, since there
-  is nothing left making a claim about it.
+  from the report — quarantined, or filtered out by a grep — is posted as **not run**.
+  Every posted result comes from this run alone; nothing is carried over from an
+  earlier sync, so one bad run can never leave a result behind.
+- Pass `--adopt-only` when your CI owns test execution. Without it, a suite listed in
+  `testSuites` that has no adopted report is run by the sync itself — under the sync's
+  configuration, not your CI's. With it, that suite is skipped and its covered stories
+  post as not run, which is what actually happened.
 - Naming a file that does not exist is an error, not an empty parse. Reporting a whole
   suite as untested because of a typo is worse than failing.
 
