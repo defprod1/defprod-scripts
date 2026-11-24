@@ -360,6 +360,12 @@ npx @defprod/scripts defprod-sync-tests \
 - Several comma-separated paths are **unioned**, for a run split across passes (for
   example a parallel pass plus a single-worker pass for tests that must not run
   concurrently). Adopting only one would report the rest as unrun.
+- **Suites run in two passes.** If your Playwright suite runs as a main pass plus a
+  second pass selected by an env var or tag (say `@exclusive` tests on one worker),
+  run both passes yourself, each with its own env, writing one JSON report per pass.
+  Then adopt both in **one** entry with `--adopt-only`. Do not list the same
+  `<harness>:<dir>` twice in `testSuites` to get two runs: suites merge first-wins,
+  so the second pass's stories would be dropped.
 - Coverage is still walked from `<dir>`, so a story whose spec exists but is absent
   from the report — quarantined, or filtered out by a grep — is posted as **not run**.
   Every posted result comes from this run alone; nothing is carried over from an
@@ -374,6 +380,29 @@ npx @defprod/scripts defprod-sync-tests \
 Generate the reports with each harness's JSON reporter — `--reporter=json` for
 Playwright, `--reporter=json --outputFile.json=…` for Vitest. Keep your normal
 reporter alongside it if something else reads that output.
+
+### Known-failing tests
+
+Some teams pin a logged defect with a test that is *expected* to fail, so the test
+flips the moment the fix lands. The sync reports these as **known failing**, never
+as passing:
+
+| Harness    | Marker                                  | How it is detected                                  |
+|------------|-----------------------------------------|-----------------------------------------------------|
+| Playwright | `test.fail()`, `test.fail(title, fn)`   | `expectedStatus: "failed"` and the test failed as expected |
+| Playwright | `test.fixme`                            | the `fixme` annotation (declared broken, not run)   |
+| Vitest     | `it.fails` / `test.fails`               | the spec source (the JSON reporter carries no marker) |
+| Jest       | `it.failing` / `test.failing`           | the spec source, as for Vitest                       |
+
+- Each story gets `knownFailingTests` and `knownFailingTestTitles`. A story whose only
+  non-passing tests are known failures posts the result `knownFailing`. A real
+  failure or a flaky test takes precedence.
+- Once the defect is fixed, the harness reports the marked test as **failed**, and
+  the sync posts it as a failure so the stale marker gets noticed and flipped.
+- Source detection reads the first string-literal argument of the marked call, so
+  give these tests a literal title, not one built with `${…}`.
+- A DefProd server older than this feature refuses the new fields. The sync then
+  re-posts with known failures counted as failures, and prints a warning.
 
 ## License
 

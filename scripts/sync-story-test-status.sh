@@ -45,6 +45,25 @@
 #   --init              Interactive setup — creates .defprod/ config
 #   --version, -v       Print version and exit
 #
+# Known failing: a test marked as expected to fail — Vitest it.fails, Jest
+# test.failing, Playwright test.fail() — whose defect is still present is counted
+# in knownFailingTests (title in knownFailingTestTitles), never in passedTests; a
+# Playwright test.fixme counts as known failing too. A story whose only
+# non-passing tests are known failures posts result "knownFailing"; a real
+# failure or flake takes precedence. Once the defect is fixed the harness reports
+# the marked test as failed, and it is posted as a failure so the marker gets
+# flipped. Vitest and Jest put no marker in their JSON, so the spec source is
+# scanned for it.
+#
+# Suites run in more than one pass (e.g. a parallel pass plus an @exclusive
+# single-worker pass selected by an env var): run every pass yourself, write one
+# JSON report per pass, and adopt them together in ONE entry, so stories from
+# every pass get results:
+#   --adopt-only \
+#   --adopt-report 'playwright:e2e:reports/main.json,reports/exclusive.json'
+# Never list the same harness:dir twice in --test-suites for this: suites merge
+# first-wins, so the second pass's stories would be dropped.
+#
 # Every posted result reflects THIS run only. A covered story the run produced no
 # result for (quarantined, filtered out, or absent from an adopted report) is
 # posted as not run — nothing is carried over from an earlier sync.
@@ -566,6 +585,8 @@ parse_playwright_results() {
                 title: .title,
                 tests: [.tests[] | {
                     status: .status,
+                    expectedStatus: (.expectedStatus // "passed"),
+                    annotationTypes: [(.annotations // [])[] | .type],
                     results: [.results[] | .status]
                 }]
             }
@@ -595,21 +616,31 @@ parse_playwright_results() {
             (group_by(.title) | [.[] |
                 [.[].tests[]] as $allTests |
                 ([$allTests[] | select(.status != "skipped")] | length) as $ranCount |
+                ([$allTests[] | select(.status == "unexpected")] | length > 0) as $failed |
                 {
                     title: .[0].title,
-                    failed: ([$allTests[] | select(.status == "unexpected")] | length > 0),
+                    failed: $failed,
                     flaky: ([$allTests[] | .results[] | select(. == "flaky")] | length > 0),
-                    skippedOnly: ($ranCount == 0)
+                    skippedOnly: ($ranCount == 0),
+                    # Known failing: test.fail() whose defect is still present (it
+                    # failed as expected), or test.fixme (declared broken, not run).
+                    # A test.fail() whose defect is FIXED reports "unexpected" and
+                    # stays a real failure, so the stale marker gets flipped.
+                    known: (($failed | not) and (
+                        ([$allTests[] | select(.expectedStatus == "failed" and .status == "expected")] | length > 0)
+                        or ([$allTests[] | .annotationTypes[] | select(. == "fixme")] | length > 0)
+                    ))
                 }
             ]) as $dedupedSpecs |
 
-            ([$dedupedSpecs[] | select(.skippedOnly | not)]) as $activeSpecs |
-            ([$dedupedSpecs[] | select(.skippedOnly)])     as $skippedSpecs |
+            ([$dedupedSpecs[] | select((.skippedOnly | not) or .known)]) as $activeSpecs |
+            ([$dedupedSpecs[] | select(.skippedOnly and (.known | not))]) as $skippedSpecs |
 
             ($activeSpecs | length) as $total |
-            ([$activeSpecs[] | select(.failed | not)] | length) as $passed |
+            ([$activeSpecs[] | select(.known)] | length) as $known |
+            ([$activeSpecs[] | select((.failed | not) and (.known | not))] | length) as $passed |
             ([$activeSpecs[] | select(.failed) | select(.flaky)] | length) as $flaky |
-            ($total - $passed - $flaky) as $failed |
+            ($total - $passed - $flaky - $known) as $failed |
             ($skippedSpecs | length) as $skipped |
 
             # An all-skipped story (no active specs) has NO pass/fail outcome — it
@@ -618,9 +649,11 @@ parse_playwright_results() {
             (if $total == 0 then null
              elif $failed > 0 then "failing"
              elif $flaky > 0 then "flaky"
+             elif $known > 0 then "knownFailing"
              else "passing" end) as $result |
 
             ([$activeSpecs[] | select(.failed) | .title] | unique) as $failedTitles |
+            ([$activeSpecs[] | select(.known) | .title] | unique) as $knownTitles |
 
             {
                 areaKey: $areaKey,
@@ -632,6 +665,8 @@ parse_playwright_results() {
                 flakyTests: $flaky,
                 skippedTests: $skipped,
                 failedTestTitles: $failedTitles,
+                knownFailingTests: $known,
+                knownFailingTestTitles: $knownTitles,
                 lastRunAt: (now | todate)
             }
         ]
@@ -662,16 +697,53 @@ run_jest_suite() {
     npx jest --config="$config_abs" --json --outputFile="$out_json" "$dir" 2>/dev/null || true
 }
 
-# parse_jest_compat_results <results_json>
+# build_known_failing_markers <results_json> <suite_dir>
+# Vitest's and Jest's JSON reporters carry NO marker for it.fails / test.failing:
+# a known-failing test whose defect is still present simply reports "passed".
+# So the markers are read from the spec SOURCE. For every file the report names,
+# emits { "<name as reported>": ["<title>", ...] } — the first string-literal
+# argument of each it/test(.concurrent|.only|.sequential)*.fails|failing( call.
+# A report adopted from another machine names paths that do not exist here; the
+# file is then found under <suite_dir> by its last three path segments
+# (<AREA>/<STORY>/<file>, or <dir>/<dir>/<KEY>.test.ts for system suites).
+build_known_failing_markers() {
+    local results_json="$1"
+    local suite_dir="$2"
+    local out="{}"
+    local name src tail titles
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        src="$name"
+        if [[ ! -f "$src" && -n "$suite_dir" && -d "$suite_dir" ]]; then
+            tail=$(awk -F/ '{ n=NF; if (n>=3) print $(n-2)"/"$(n-1)"/"$n; else print $0 }' <<< "$name")
+            src=$(find "$suite_dir" -path "*/$tail" -type f 2>/dev/null | head -n 1)
+        fi
+        [[ -n "$src" && -f "$src" ]] || continue
+        titles=$(jq -Rs '
+            [scan("\\b(?:it|test)(?:\\.(?:concurrent|only|sequential))*\\.(?:fails|failing)\\s*\\(\\s*(?:\u0027((?:[^\u0027\\\\]|\\\\.)*)\u0027|\"((?:[^\"\\\\]|\\\\.)*)\"|`((?:[^`$\\\\]|\\\\.)*)`)")
+             | map(select(. != null)) | .[0]
+             | gsub("\\\\(?<c>.)"; .c)]
+        ' "$src" 2>/dev/null) || continue
+        [[ "$titles" == "[]" ]] && continue
+        out=$(jq --arg f "$name" --argjson t "$titles" '. + { ($f): $t }' <<< "$out")
+    done < <(jq -r '(.testResults // [])[] | .name' "$results_json" 2>/dev/null)
+    echo "$out"
+}
+
+# parse_jest_compat_results <results_json> <suite_dir>
 # Vitest's JSON reporter is Jest-compatible. Both produce { testResults: [
 #   { name: <spec.test.ts path>, status, assertionResults: [ {title, fullName, status, ...} ] }
 # ]}.
 parse_jest_compat_results() {
     local results_json="$1"
+    local suite_dir="${2:-}"
 
     [[ -f "$results_json" ]] || { echo "[]"; return 0; }
 
-    jq --slurpfile r "$results_json" '
+    local markers_json="$RESULTS_DIR/known-failing-markers.$$.json"
+    build_known_failing_markers "$results_json" "$suite_dir" > "$markers_json"
+
+    jq --slurpfile r "$results_json" --slurpfile k "$markers_json" '
         ($r[0].testResults // []) as $files |
 
         # For each spec file: extract (areaKey, storyKey) from the path.
@@ -681,10 +753,11 @@ parse_jest_compat_results() {
             # Story keys may have multiple dash-segments (e.g. CORE-MOB-10).
             (.name | capture("(?:^|/)(?<areaKey>[A-Z0-9_]+)/(?<storyKey>[A-Z0-9_]+(?:-[A-Z0-9_]+)+)/[^/]+\\.test\\.ts$")) as $m |
             select($m != null) |
+            .name as $file |
             {
                 areaKey: $m.areaKey,
                 storyKey: $m.storyKey,
-                tests: (.assertionResults // [])
+                tests: [(.assertionResults // [])[] | . + { known: ((.title as $t | ($k[0][$file] // []) | index($t)) != null) }]
             }
         ] |
 
@@ -698,7 +771,12 @@ parse_jest_compat_results() {
             ([.[] | .tests[]]) as $allTests |
 
             ($allTests | length) as $total |
-            ([$allTests[] | select(.status == "passed")] | length) as $passed |
+            # it.fails / test.failing report "passed" while their defect is still
+            # present. The source scan marks them; they are known failing, never
+            # passed. Once the defect is fixed they report "failed" — a real
+            # failure, so the stale marker gets flipped.
+            ([$allTests[] | select(.status == "passed" and .known)] | length) as $known |
+            ([$allTests[] | select(.status == "passed" and (.known | not))] | length) as $passed |
             ([$allTests[] | select(.status == "failed")] | length) as $failed |
             ([$allTests[] | select(.status == "pending" or .status == "skipped" or .status == "todo")] | length) as $skipped |
 
@@ -710,10 +788,12 @@ parse_jest_compat_results() {
             # placeholder string "no-run" (which the backend rejects with
             # "Invalid Request").
             (if $failed > 0 then "failing"
+             elif $known > 0 then "knownFailing"
              elif $passed > 0 then "passing"
              else null end) as $result |
 
             ([$allTests[] | select(.status == "failed") | .title] | unique) as $failedTitles |
+            ([$allTests[] | select(.status == "passed" and .known) | .title] | unique) as $knownTitles |
 
             {
                 areaKey: $areaKey,
@@ -725,6 +805,8 @@ parse_jest_compat_results() {
                 flakyTests: $flaky,
                 skippedTests: $skipped,
                 failedTestTitles: $failedTitles,
+                knownFailingTests: $known,
+                knownFailingTestTitles: $knownTitles,
                 lastRunAt: (now | todate)
             }
         ]
@@ -739,19 +821,24 @@ parse_jest_compat_results() {
 # (e.g. user-events.test.ts) are ignored.
 parse_system_results() {
     local results_json="$1"
+    local suite_dir="${2:-}"
 
     [[ -f "$results_json" ]] || { echo "[]"; return 0; }
 
-    jq --slurpfile r "$results_json" '
+    local markers_json="$RESULTS_DIR/known-failing-markers.$$.json"
+    build_known_failing_markers "$results_json" "$suite_dir" > "$markers_json"
+
+    jq --slurpfile r "$results_json" --slurpfile k "$markers_json" '
         ($r[0].testResults // []) as $files |
 
         [$files[] |
             (.name | capture("(?:^|/)(?<storyKey>[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\\.test\\.ts$")) as $m |
             select($m != null) |
+            .name as $file |
             {
                 areaKey: ($m.storyKey | split("-")[0]),
                 storyKey: $m.storyKey,
-                tests: (.assertionResults // [])
+                tests: [(.assertionResults // [])[] | . + { known: ((.title as $t | ($k[0][$file] // []) | index($t)) != null) }]
             }
         ] |
 
@@ -763,17 +850,24 @@ parse_system_results() {
             ([.[] | .tests[]]) as $allTests |
 
             ($allTests | length) as $total |
-            ([$allTests[] | select(.status == "passed")] | length) as $passed |
+            # it.fails / test.failing report "passed" while their defect is still
+            # present. The source scan marks them; they are known failing, never
+            # passed. Once the defect is fixed they report "failed" — a real
+            # failure, so the stale marker gets flipped.
+            ([$allTests[] | select(.status == "passed" and .known)] | length) as $known |
+            ([$allTests[] | select(.status == "passed" and (.known | not))] | length) as $passed |
             ([$allTests[] | select(.status == "failed")] | length) as $failed |
             ([$allTests[] | select(.status == "pending" or .status == "skipped" or .status == "todo")] | length) as $skipped |
 
             0 as $flaky |
 
             (if $failed > 0 then "failing"
+             elif $known > 0 then "knownFailing"
              elif $passed > 0 then "passing"
              else null end) as $result |
 
             ([$allTests[] | select(.status == "failed") | .title] | unique) as $failedTitles |
+            ([$allTests[] | select(.status == "passed" and .known) | .title] | unique) as $knownTitles |
 
             {
                 areaKey: $areaKey,
@@ -785,6 +879,8 @@ parse_system_results() {
                 flakyTests: $flaky,
                 skippedTests: $skipped,
                 failedTestTitles: $failedTitles,
+                knownFailingTests: $known,
+                knownFailingTestTitles: $knownTitles,
                 lastRunAt: (now | todate)
             }
         ]
@@ -850,7 +946,7 @@ for suite_spec in "${TEST_SUITES[@]}"; do
                 echo "  Running Vitest..."
                 run_vitest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
             fi
-            parse_jest_compat_results "$suite_results_raw" > "$suite_results_parsed"
+            parse_jest_compat_results "$suite_results_raw" "$suite_dir" > "$suite_results_parsed"
             ;;
         system)
             # Filename-keyed unit tests, run via Vitest; attribute by basename.
@@ -858,14 +954,14 @@ for suite_spec in "${TEST_SUITES[@]}"; do
                 echo "  Running Vitest (system)..."
                 run_vitest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
             fi
-            parse_system_results "$suite_results_raw" > "$suite_results_parsed"
+            parse_system_results "$suite_results_raw" "$suite_dir" > "$suite_results_parsed"
             ;;
         jest)
             if [[ -z "$suite_adopted" ]]; then
                 echo "  Running Jest..."
                 run_jest_suite "$suite_dir" "$suite_config" "$suite_results_raw"
             fi
-            parse_jest_compat_results "$suite_results_raw" > "$suite_results_parsed"
+            parse_jest_compat_results "$suite_results_raw" "$suite_dir" > "$suite_results_parsed"
             ;;
         *)
             echo "  Unknown harness — skipping" >&2
@@ -936,6 +1032,8 @@ echo "$STORIES_JSON" | jq \
             flakyTests: null,
             skippedTests: null,
             failedTestTitles: [],
+            knownFailingTests: null,
+            knownFailingTestTitles: [],
             lastRunAt: null
         }) | if $r != null then
             . + {
@@ -946,6 +1044,8 @@ echo "$STORIES_JSON" | jq \
                 flakyTests: $r.flakyTests,
                 skippedTests: $r.skippedTests,
                 failedTestTitles: $r.failedTestTitles,
+                knownFailingTests: ($r.knownFailingTests // 0),
+                knownFailingTestTitles: ($r.knownFailingTestTitles // []),
                 lastRunAt: $r.lastRunAt
             }
         else . end
@@ -953,7 +1053,7 @@ echo "$STORIES_JSON" | jq \
 
 echo ""
 echo "Per-story summary:"
-jq -r '.[] | "  \(.storyKey): \(.coverage) / \(.result // "no-run") \(.passedTests // "-")/\(.totalTests // "-") \(if (.failedTestTitles | length) > 0 then "FAILED: " + (.failedTestTitles | join(", ")) else "" end)"' "$STATUSES_FILE"
+jq -r '.[] | "  \(.storyKey): \(.coverage) / \(.result // "no-run") \(.passedTests // "-")/\(.totalTests // "-") \(if (.failedTestTitles | length) > 0 then "FAILED: " + (.failedTestTitles | join(", ")) else "" end)\(if (.knownFailingTestTitles | length) > 0 then " KNOWN FAILING: " + (.knownFailingTestTitles | join(", ")) else "" end)"' "$STATUSES_FILE"
 
 # ---- Step 5: Build and post payload ----
 
@@ -994,10 +1094,36 @@ jq 'del(.input.statuses[] | .storyStatus, .surface)' "$PAYLOAD_FILE" > "$POST_PA
 echo ""
 echo "Posting results to DefProd..."
 
-RESPONSE=$(curl -sk -X POST "$API_URL" \
-    -H "Content-Type: application/json" \
-    -H "x-api-key: $API_KEY" \
-    -d "@$POST_PAYLOAD_FILE" 2>/dev/null)
+post_payload() {
+    curl -sk -X POST "$API_URL" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $API_KEY" \
+        -d "@$1" 2>/dev/null
+}
+
+RESPONSE=$(post_payload "$POST_PAYLOAD_FILE")
+
+# A server that predates known-failing reporting refuses the new fields (it
+# rejects undeclared keys) and the new result value. Rather than lose the whole
+# sync, re-post in the older shape with every known failure folded into the
+# failures — so a known-broken story still reads as failing, never as passing.
+if [[ "$(echo "$RESPONSE" | jq -r '.meta.error // false')" == "true" ]] \
+    && echo "$RESPONSE" | grep -qi 'knownFailing'; then
+    echo "Warning: this DefProd server does not accept known-failing results yet;" >&2
+    echo "         re-posting with known failures reported as failures." >&2
+    LEGACY_PAYLOAD_FILE="$RESULTS_DIR/payload.legacy.json"
+    jq '.input.statuses |= map(
+            (.knownFailingTests // 0) as $k |
+            (.knownFailingTestTitles // []) as $kt |
+            del(.knownFailingTests, .knownFailingTestTitles)
+            | if $k > 0 then
+                .failedTests = ((.failedTests // 0) + $k)
+                | .failedTestTitles = ((.failedTestTitles + $kt) | unique)
+                | .result = (if .result == "knownFailing" then "failing" else .result end)
+              else . end
+        )' "$POST_PAYLOAD_FILE" > "$LEGACY_PAYLOAD_FILE"
+    RESPONSE=$(post_payload "$LEGACY_PAYLOAD_FILE")
+fi
 
 UPSERTED=$(echo "$RESPONSE" | jq -r '.data.upsertedCount // "?"')
 DELETED=$(echo "$RESPONSE" | jq -r '.data.deletedCount // "?"')
